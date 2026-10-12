@@ -32,6 +32,12 @@ impl MouseInterest {
         layer.push((id, interest));
     }
 
+    pub fn remove(&mut self, id: WidgetId) {
+        for layer in &mut self.layers {
+            layer.retain(|(widget, _)| *widget != id);
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (WidgetId, EventInterest)> + '_ {
         self.layers
             .iter()

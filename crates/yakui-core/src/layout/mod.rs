@@ -76,6 +76,19 @@ impl LayoutDom {
         self.nodes.get_mut(id.index())
     }
 
+    /// Disable event delivery to an already-laid-out subtree while retaining its
+    /// geometry for paint (for example, during an overlay exit animation).
+    /// The owning widget must also reject navigation and restore focus as needed.
+    pub fn disable_input(&mut self, dom: &Dom, id: WidgetId) {
+        if let Some(node) = self.get_mut(id) {
+            node.event_interest = EventInterest::empty();
+        }
+        self.interest_mouse.remove(id);
+        for &child in &dom.get(id).unwrap().children {
+            self.disable_input(dom, child);
+        }
+    }
+
     /// Set the viewport of the DOM in unscaled units.
     pub fn set_unscaled_viewport(&mut self, view: Rect) {
         self.unscaled_viewport = view;

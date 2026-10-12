@@ -138,3 +138,123 @@ fn frame_timestamp_is_shared_by_widgets_and_advances_only_at_start() {
     assert!(yak.dom().frame_time() >= timestamp);
     yak.finish();
 }
+
+#[derive(Debug, Default)]
+struct EventTarget {
+    events: std::rc::Rc<std::cell::Cell<usize>>,
+}
+impl Widget for EventTarget {
+    type Props<'a> = std::rc::Rc<std::cell::Cell<usize>>;
+    type Response = ();
+    fn new() -> Self {
+        Self::default()
+    }
+    fn update(&mut self, events: Self::Props<'_>) {
+        self.events = events;
+    }
+    fn focus_policy(&self) -> yakui_core::widget::FocusPolicy {
+        yakui_core::widget::FocusPolicy::SEQUENTIAL | yakui_core::widget::FocusPolicy::POINTER
+    }
+    fn event_interest(&self) -> yakui_core::event::EventInterest {
+        yakui_core::event::EventInterest::MOUSE_INSIDE
+            | yakui_core::event::EventInterest::FOCUSED_KEYBOARD
+    }
+    fn event(
+        &mut self,
+        _: yakui_core::widget::EventContext<'_>,
+        event: &yakui_core::event::WidgetEvent,
+    ) -> yakui_core::event::EventResponse {
+        if matches!(
+            event,
+            yakui_core::event::WidgetEvent::MouseButtonChanged { .. }
+                | yakui_core::event::WidgetEvent::KeyChanged { .. }
+        ) {
+            self.events.set(self.events.get() + 1);
+        }
+        yakui_core::event::EventResponse::Sink
+    }
+}
+#[derive(Debug, Default)]
+struct InputGate {
+    enabled: bool,
+}
+impl Widget for InputGate {
+    type Props<'a> = bool;
+    type Response = ();
+    fn new() -> Self {
+        Self::default()
+    }
+    fn update(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+    fn layout(&self, ctx: LayoutContext<'_>, constraints: Constraints) -> Vec2 {
+        let size = self.default_layout(
+            LayoutContext {
+                dom: ctx.dom,
+                input: ctx.input,
+                layout: ctx.layout,
+                paint: ctx.paint,
+            },
+            constraints,
+        );
+        if !self.enabled {
+            ctx.layout.disable_input(ctx.dom, ctx.dom.current());
+        }
+        size
+    }
+}
+fn input_frame(
+    yak: &mut Yakui,
+    enabled: bool,
+    events: std::rc::Rc<std::cell::Cell<usize>>,
+) -> yakui_core::WidgetId {
+    yak.start();
+    let gate = yak.dom().begin_widget::<InputGate>(enabled);
+    let target = yak.dom().do_widget::<EventTarget>(events);
+    yak.dom().end_widget::<InputGate>(gate.id);
+    yak.finish();
+    target.id
+}
+#[test]
+fn noninteractive_subtree_keeps_layout_and_ignores_pointer_and_keyboard_events() {
+    use yakui_core::{
+        event::Event,
+        input::{KeyCode, MouseButton},
+    };
+    let mut yak = Yakui::new();
+    yak.set_surface_size(Vec2::splat(100.0));
+    yak.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, Vec2::splat(100.0)));
+    let events = std::rc::Rc::new(std::cell::Cell::new(0));
+    let target = input_frame(&mut yak, true, events.clone());
+    yak.request_focus(Some(target));
+    yak.handle_event(Event::CursorMoved(Some(Vec2::splat(50.0))));
+    yak.handle_event(Event::MouseButtonChanged {
+        button: MouseButton::One,
+        down: true,
+    });
+    assert_eq!(events.get(), 1);
+    input_frame(&mut yak, false, events.clone());
+    assert_eq!(
+        yak.layout_dom().get(target).unwrap().rect.size(),
+        Vec2::splat(100.0)
+    );
+    yak.handle_event(Event::CursorMoved(Some(Vec2::splat(50.0))));
+    yak.handle_event(Event::MouseButtonChanged {
+        button: MouseButton::One,
+        down: false,
+    });
+    yak.handle_event(Event::KeyChanged {
+        key: KeyCode::Enter,
+        down: true,
+        modifiers: None,
+    });
+    assert_eq!(events.get(), 1);
+    input_frame(&mut yak, true, events.clone());
+    yak.request_focus(Some(target));
+    yak.handle_event(Event::KeyChanged {
+        key: KeyCode::Enter,
+        down: false,
+        modifiers: None,
+    });
+    assert_eq!(events.get(), 2);
+}
