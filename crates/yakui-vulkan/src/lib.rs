@@ -1,12 +1,14 @@
 #![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+mod allocator;
 mod buffer;
 mod descriptors;
 mod util;
 mod vulkan_context;
 mod vulkan_texture;
 
+pub use allocator::MemoryStats;
 use ash::util::read_spv;
 pub use ash::vk;
 use bytemuck::{bytes_of, Pod, Zeroable};
@@ -594,14 +596,19 @@ impl YakuiVulkan {
         device.device_wait_idle().unwrap();
         self.descriptors.cleanup(device);
         for (_, texture) in self.yakui_managed_textures.drain() {
-            texture.cleanup(device);
+            texture.cleanup(device, &mut self.uploads.memory);
         }
         for (_, texture) in self.user_textures.drain() {
-            texture.cleanup(device);
+            texture.cleanup(device, &mut self.uploads.memory);
         }
         device.destroy_pipeline(self.graphics_pipeline, None);
         device.destroy_pipeline_layout(self.pipeline_layout, None);
         self.uploads.cleanup(device);
+    }
+
+    /// Current backing memory and live allocations, excluding host-imported images.
+    pub fn memory_stats(&self) -> MemoryStats {
+        self.uploads.memory.stats()
     }
 
     /// Provides access to the descriptors used by `YakuiVulkan` to manage textures.

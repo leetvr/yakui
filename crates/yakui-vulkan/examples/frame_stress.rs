@@ -444,6 +444,7 @@ unsafe fn run() {
     yak.set_surface_size(Vec2::splat(64.0));
     yak.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, Vec2::splat(64.0)));
     renderer.set_paint_limits(&context, &mut yak);
+    let mut warmed_memory = None;
     for batch in 0..112 {
         for (slot, frame) in frames.iter().enumerate() {
             let number = batch * 3 + slot;
@@ -680,9 +681,29 @@ unsafe fn run() {
             );
             renderer.transfers_finished(&context);
         }
+        let memory = renderer.memory_stats();
+        if batch == 4 {
+            assert!(
+                memory.device_allocations < memory.live_allocations,
+                "buffers should share backing allocations: {memory:?}"
+            );
+            warmed_memory = Some(memory);
+        } else if batch > 4 {
+            assert_eq!(
+                memory,
+                warmed_memory.unwrap(),
+                "memory keeps growing after warmup"
+            );
+        }
         device.reset_fences(&fences).unwrap();
     }
+    println!("Pooled memory after warmup: {:?}", warmed_memory.unwrap());
     renderer.cleanup(&device);
+    assert_eq!(
+        renderer.memory_stats(),
+        Default::default(),
+        "memory survives cleanup"
+    );
     for frame in frames {
         device.destroy_fence(frame.fence, None);
         device.destroy_framebuffer(frame.framebuffer, None);

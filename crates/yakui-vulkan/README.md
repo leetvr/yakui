@@ -15,6 +15,21 @@ The renderer requires Vulkan 1.2 and these enabled descriptor indexing features:
 only after GPU completion. Buffers currently use persistently mapped,
 host-visible, host-coherent memory.
 
+Memory uses lazy_vulkan's offset-allocator/aligned binding approach, adapted from
+leetvr/lazy_vulkan `33aec6209289d3dd8ee684276b9f15b6a904fc21` (MIT notice retained
+in LAZY-VULKAN-LICENSE-MIT). Geometry, staging buffers and textures suballocate
+shared blocks per Vulkan memory type. Buffer and optimal-image pools are separate.
+Blocks start at 16 MiB and grow to fit larger resources; mandatory dedicated
+allocations are honored. There is no lazy_vulkan renderer/context dependency or
+fixed multi-gigabyte slab. The host continues to own submission and completion.
+
+Retired images release their ranges after frame completion. Growing unused
+buffers return their old ranges after destruction; completed frame buffers remain
+allocated for reuse. Free block space is reused and backing blocks stay allocated
+until cleanup. `memory_stats()` reports backing allocations/reserved bytes and
+live bindings (including resources still awaiting completion), excluding imported
+host image memory.
+
 ## Frame ownership
 
 Record uploads outside rendering, then one or more paints inside rendering:
@@ -65,7 +80,8 @@ cargo run -p yakui-vulkan --example frame_stress
 It checks rendered pixels with three gated frames in flight, multiple paints per
 frame, geometry growth beyond 10 MiB, clipped/offscreen draws, straight and
 premultiplied alpha, borrowed image ownership, aligned odd-sized R8 uploads, staging growth,
-and more texture allocations than the descriptor pool's capacity. It enables
+and more texture allocations than the descriptor pool's capacity. It also checks
+backing allocations stabilize after warmup and cleanup releases all memory. It enables
 synchronization validation and fails on any validation error.
 
 Paint opacity is carried independently of color alpha and is applied to the final

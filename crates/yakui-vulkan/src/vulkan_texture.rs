@@ -3,7 +3,13 @@ use std::collections::VecDeque;
 use ash::vk;
 use yakui_core as yakui;
 
-use crate::{buffer::Buffer, descriptors::Descriptors, vulkan_context::VulkanContext, Vertex};
+use crate::{
+    allocator::{Allocation, Allocator},
+    buffer::Buffer,
+    descriptors::Descriptors,
+    vulkan_context::VulkanContext,
+    Vertex,
+};
 
 pub(crate) const NO_TEXTURE_ID: u32 = u32::MAX;
 
@@ -11,11 +17,16 @@ pub(crate) const NO_TEXTURE_ID: u32 = u32::MAX;
 pub struct VulkanTexture {
     // None means the host owns the image, allocation AND view. Yakui still
     // owns this wrapper's sampler and descriptor slot until frame retirement.
-    owned: Option<(vk::Image, vk::DeviceMemory)>,
+    owned: Option<(vk::Image, TextureMemory)>,
     pub(crate) sampler: vk::Sampler,
     pub(crate) view: vk::ImageView,
     pub(crate) id: u32,
     pub(crate) premultiplied: bool,
+}
+
+enum TextureMemory {
+    Imported(vk::DeviceMemory),
+    Allocated(Allocation),
 }
 
 /// A container for information about a texture.
@@ -75,7 +86,12 @@ impl VulkanTexture {
         memory: vk::DeviceMemory,
         view: vk::ImageView,
     ) -> Self {
-        Self::from_view(vulkan_context, descriptors, view, Some((image, memory)))
+        Self::from_view(
+            vulkan_context,
+            descriptors,
+            view,
+            Some((image, TextureMemory::Imported(memory))),
+        )
     }
 
     /// Register a host-owned sampled image view without taking its allocation.
@@ -104,7 +120,7 @@ impl VulkanTexture {
         vulkan_context: &VulkanContext,
         descriptors: &mut Descriptors,
         view: vk::ImageView,
-        owned: Option<(vk::Image, vk::DeviceMemory)>,
+        owned: Option<(vk::Image, TextureMemory)>,
     ) -> Self {
         let address_mode = vk::SamplerAddressMode::CLAMP_TO_EDGE;
         let filter = vk::Filter::LINEAR;
@@ -149,7 +165,8 @@ impl VulkanTexture {
             premultiplied,
         } = create_info;
 
-        let (image, memory) = unsafe { vulkan_context.create_image(resolution, format) };
+        let (image, memory) =
+            unsafe { vulkan_context.create_image(&mut queue.memory, resolution, format) };
         unsafe {
             queue.push(vulkan_context, image, resolution, image_data.as_ref());
         }
@@ -174,7 +191,7 @@ impl VulkanTexture {
             unsafe { descriptors.update_texture_descriptor_set(view, sampler, vulkan_context) };
 
         VulkanTexture {
-            owned: Some((image, memory)),
+            owned: Some((image, TextureMemory::Allocated(memory))),
             view,
             sampler,
             id,
@@ -215,12 +232,15 @@ impl VulkanTexture {
         )
     }
 
-    pub(crate) unsafe fn cleanup(&self, device: &ash::Device) {
+    pub(crate) unsafe fn cleanup(self, device: &ash::Device, allocator: &mut Allocator) {
         device.destroy_sampler(self.sampler, None);
         if let Some((image, memory)) = self.owned {
             device.destroy_image_view(self.view, None);
             device.destroy_image(image, None);
-            device.free_memory(memory, None);
+            match memory {
+                TextureMemory::Imported(memory) => device.free_memory(memory, None),
+                TextureMemory::Allocated(memory) => allocator.free(device, memory),
+            }
         }
     }
 }
@@ -249,6 +269,7 @@ fn get_address_mode(yakui_address_mode: yakui::paint::AddressMode) -> vk::Sample
 
 #[derive(Default)]
 pub(crate) struct UploadQueue {
+    pub memory: Allocator,
     phase: FrameResources,
     in_flight: VecDeque<FrameResources>,
     available: Vec<FrameResources>,
@@ -281,8 +302,9 @@ impl UploadQueue {
     ) {
         let mut finished = self.in_flight.pop_front().expect("no frames in flight");
         for texture in finished.graveyard.drain(..) {
-            texture.cleanup(context.device);
-            descriptors.release_texture(texture.id);
+            let id = texture.id;
+            texture.cleanup(context.device, &mut self.memory);
+            descriptors.release_texture(id);
         }
         finished.geometry_used = 0;
         finished.staging_used = 0;
@@ -310,11 +332,13 @@ impl UploadQueue {
             self.phase.geometry.push(GeometryBuffers {
                 vertices: Buffer::with_capacity(
                     context,
+                    &mut self.memory,
                     vk::BufferUsageFlags::VERTEX_BUFFER,
                     vertices.len(),
                 ),
                 indices: Buffer::with_capacity(
                     context,
+                    &mut self.memory,
                     vk::BufferUsageFlags::INDEX_BUFFER,
                     indices.len(),
                 ),
@@ -324,8 +348,10 @@ impl UploadQueue {
         // This pair has not been used in this frame. Earlier frames cannot own
         // it because only GPU-completed slots enter the available pool. A second
         // paint call receives another pair so it cannot overwrite recorded data.
-        pair.vertices.reserve(context, vertices.len());
-        pair.indices.reserve(context, indices.len());
+        pair.vertices
+            .reserve(context, &mut self.memory, vertices.len());
+        pair.indices
+            .reserve(context, &mut self.memory, indices.len());
         pair.vertices.write(0, vertices);
         pair.indices.write(0, indices);
         self.phase.geometry_used += 1;
@@ -353,7 +379,7 @@ impl UploadQueue {
             },
             ..Default::default()
         });
-        let (buffer, offset) = self.phase.push(vulkan_context, data);
+        let (buffer, offset) = self.phase.push(vulkan_context, &mut self.memory, data);
         self.textures.push((image, extent, buffer, offset));
         self.post_barriers.push(vk::ImageMemoryBarrier {
             src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
@@ -418,10 +444,11 @@ impl UploadQueue {
     }
 
     pub unsafe fn cleanup(&mut self, device: &ash::Device) {
-        self.phase.cleanup(device);
+        self.phase.cleanup(device, &mut self.memory);
         for mut phase in self.in_flight.drain(..).chain(self.available.drain(..)) {
-            phase.cleanup(device);
+            phase.cleanup(device, &mut self.memory);
         }
+        self.memory.cleanup(device);
     }
 }
 
@@ -440,25 +467,35 @@ struct GeometryBuffers {
 }
 
 impl FrameResources {
-    unsafe fn cleanup(&mut self, device: &ash::Device) {
+    unsafe fn cleanup(&mut self, device: &ash::Device, allocator: &mut Allocator) {
         for (buffer, _) in self.buffers.drain(..) {
-            buffer.cleanup(device);
+            buffer.cleanup(device, allocator);
         }
         for pair in self.geometry.drain(..) {
-            pair.vertices.cleanup(device);
-            pair.indices.cleanup(device);
+            pair.vertices.cleanup(device, allocator);
+            pair.indices.cleanup(device, allocator);
         }
         for texture in self.graveyard.drain(..) {
-            texture.cleanup(device);
+            texture.cleanup(device, allocator);
         }
     }
 
-    unsafe fn push(&mut self, context: &VulkanContext, data: &[u8]) -> (vk::Buffer, usize) {
+    unsafe fn push(
+        &mut self,
+        context: &VulkanContext,
+        allocator: &mut Allocator,
+        data: &[u8],
+    ) -> (vk::Buffer, usize) {
         loop {
             let index = self.staging_used;
             if index == self.buffers.len() {
                 self.buffers.push((
-                    Buffer::with_capacity(context, vk::BufferUsageFlags::TRANSFER_SRC, data.len()),
+                    Buffer::with_capacity(
+                        context,
+                        allocator,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        data.len(),
+                    ),
                     0,
                 ));
             }
@@ -467,7 +504,7 @@ impl FrameResources {
             // R8 images. Never relocate a chunk referenced by an earlier copy.
             let start = (*fill + 3) & !3;
             if *fill == 0 {
-                buffer.reserve(context, data.len());
+                buffer.reserve(context, allocator, data.len());
             }
             if start + data.len() <= buffer.capacity() {
                 *fill = start + data.len();

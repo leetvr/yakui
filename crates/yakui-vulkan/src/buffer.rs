@@ -1,6 +1,9 @@
 use ash::vk;
 
-use crate::{util::find_memorytype_index, vulkan_context::VulkanContext};
+use crate::{
+    allocator::{Allocation, Allocator},
+    vulkan_context::VulkanContext,
+};
 
 // Small controls should not each cost a megabyte. Growth rounds up geometrically,
 // and completed frames retain their high-water capacity for subsequent frames.
@@ -9,7 +12,7 @@ const MIN_BUFFER_SIZE: usize = 64 * 1024;
 /// An exclusively owned, persistently mapped host-coherent buffer.
 pub(crate) struct Buffer<T> {
     pub handle: vk::Buffer,
-    memory: vk::DeviceMemory,
+    memory: Allocation,
     usage: vk::BufferUsageFlags,
     capacity: usize,
     ptr: std::ptr::NonNull<T>,
@@ -18,6 +21,7 @@ pub(crate) struct Buffer<T> {
 impl<T: Copy> Buffer<T> {
     pub fn with_capacity(
         context: &VulkanContext,
+        allocator: &mut Allocator,
         usage: vk::BufferUsageFlags,
         elements: usize,
     ) -> Self {
@@ -36,24 +40,8 @@ impl<T: Copy> Buffer<T> {
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let handle = unsafe { device.create_buffer(&info, None).unwrap() };
-        let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
-        let memory_index = find_memorytype_index(
-            &requirements,
-            &context.memory_properties,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .expect("Unable to find host-coherent buffer memory");
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_index);
-        let memory = unsafe { device.allocate_memory(&allocation, None).unwrap() };
-        let ptr = unsafe {
-            device.bind_buffer_memory(handle, memory, 0).unwrap();
-            let ptr = device
-                .map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
-                .unwrap();
-            std::ptr::NonNull::new_unchecked(ptr.cast())
-        };
+        let memory = unsafe { allocator.buffer(context, handle) };
+        let ptr = memory.ptr.expect("buffer memory must be mapped").cast();
         Self {
             handle,
             memory,
@@ -66,11 +54,16 @@ impl<T: Copy> Buffer<T> {
     }
 
     /// Grow an unused buffer. No recorded or executing command may reference it.
-    pub unsafe fn reserve(&mut self, context: &VulkanContext, elements: usize) {
+    pub unsafe fn reserve(
+        &mut self,
+        context: &VulkanContext,
+        allocator: &mut Allocator,
+        elements: usize,
+    ) {
         if elements > self.capacity {
-            let replacement = Self::with_capacity(context, self.usage, elements);
-            self.cleanup(context.device);
-            *self = replacement;
+            let replacement = Self::with_capacity(context, allocator, self.usage, elements);
+            let previous = std::mem::replace(self, replacement);
+            previous.cleanup(context.device, allocator);
         }
     }
 
@@ -89,10 +82,9 @@ impl<T: Copy> Buffer<T> {
     }
 
     /// No recorded or executing command may reference this buffer after cleanup.
-    pub unsafe fn cleanup(&self, device: &ash::Device) {
-        device.unmap_memory(self.memory);
+    pub unsafe fn cleanup(self, device: &ash::Device, allocator: &mut Allocator) {
         device.destroy_buffer(self.handle, None);
-        device.free_memory(self.memory, None);
+        allocator.free(device, self.memory);
     }
 
     pub fn capacity(&self) -> usize {
