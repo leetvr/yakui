@@ -94,6 +94,7 @@ fn nested_scopes_transform_clips_preserve_alpha_and_restore_for_siblings() {
             scale: Vec2::splat(0.5),
             translation: Vec2::new(2.0, 3.0),
             origin: Vec2::splat(4.0),
+            rotation: 0.,
         },
         0.5,
     ));
@@ -257,4 +258,32 @@ fn noninteractive_subtree_keeps_layout_and_ignores_pointer_and_keyboard_events()
         modifiers: None,
     });
     assert_eq!(events.get(), 2);
+}
+
+#[test]
+fn rotation_composes_with_scale_and_encloses_all_clip_corners() {
+    let mut yak = Yakui::new();
+    yak.set_surface_size(Vec2::splat(100.));
+    yak.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, Vec2::splat(100.)));
+    yak.start();
+    let scope = yak.dom().begin_widget::<Scope>((
+        PaintTransform {
+            rotation: std::f32::consts::FRAC_PI_2,
+            scale: Vec2::new(2., 1.),
+            translation: Vec2::new(10., 20.),
+            ..Default::default()
+        },
+        1.,
+    ));
+    let clip = yak.dom().begin_widget::<Clip>(());
+    yak.dom().do_widget::<Point>(Vec2::new(2., 3.));
+    yak.dom().end_widget::<Clip>(clip.id);
+    yak.dom().end_widget::<Scope>(scope.id);
+    yak.finish();
+    let paint = yak.paint();
+    let call = &paint.layers()[0].calls[0];
+    assert!((call.vertices[0].position * 100. - Vec2::new(7., 24.)).length() < 0.0001);
+    let clip = call.clip.unwrap();
+    assert!((clip.pos() - Vec2::new(2., 20.)).length() < 0.0001);
+    assert!((clip.size() - Vec2::new(8., 16.)).length() < 0.0001);
 }

@@ -32,9 +32,9 @@ impl MouseInterest {
         layer.push((id, interest));
     }
 
-    pub fn remove(&mut self, id: WidgetId) {
+    pub fn retain(&mut self, mut keep: impl FnMut(WidgetId) -> bool) {
         for layer in &mut self.layers {
-            layer.retain(|(widget, _)| *widget != id);
+            layer.retain(|(widget, _)| keep(*widget));
         }
     }
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use glam::Vec2;
+use glam::{Mat2, Vec2};
 use parking_lot::RwLock;
 use thunderdome::Arena;
 
@@ -28,12 +28,15 @@ pub struct PaintLimits {
     pub max_texture_size_3d: u32,
 }
 
-/// An axis-aligned paint transform in logical coordinates. Layout and hit testing
-/// remain unchanged. Scaling occurs about `origin`, followed by `translation`.
+/// A paint transform in logical coordinates. Layout and hit testing remain
+/// unchanged. Scale and rotation occur about `origin`, followed by translation.
+/// Scissor clips enclose transformed rectangles with axis-aligned bounds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaintTransform {
     /// Scale on each axis. The default is one.
     pub scale: Vec2,
+    /// Rotation in radians. Positive angles turn clockwise on the UI surface.
+    pub rotation: f32,
     /// Translation after scaling, in logical units.
     pub translation: Vec2,
     /// Fixed point about which scaling occurs.
@@ -44,6 +47,7 @@ impl Default for PaintTransform {
     fn default() -> Self {
         Self {
             scale: Vec2::ONE,
+            rotation: 0.,
             translation: Vec2::ZERO,
             origin: Vec2::ZERO,
         }
@@ -61,7 +65,7 @@ pub struct PaintDom {
 
     layers: PaintLayers,
     clip_stack: Vec<Rect>,
-    paint_scale: Vec2,
+    paint_linear: Mat2,
     paint_translation: Vec2,
     opacity: f32,
 }
@@ -134,7 +138,7 @@ impl PaintDom {
 
             layers: PaintLayers::new(),
             clip_stack: Vec::new(),
-            paint_scale: Vec2::ONE,
+            paint_linear: Mat2::IDENTITY,
             paint_translation: Vec2::ZERO,
             opacity: 1.0,
         }
@@ -162,7 +166,7 @@ impl PaintDom {
     pub fn start(&mut self) {
         self.textures_mut().texture_edits.clear();
         self.clip_stack.clear();
-        self.paint_scale = Vec2::ONE;
+        self.paint_linear = Mat2::IDENTITY;
         self.paint_translation = Vec2::ZERO;
         self.opacity = 1.0;
     }
@@ -193,12 +197,13 @@ impl PaintDom {
         transform: PaintTransform,
         paint: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let previous = (self.paint_scale, self.paint_translation);
-        let offset = transform.origin * (Vec2::ONE - transform.scale) + transform.translation;
-        self.paint_translation += self.paint_scale * offset;
-        self.paint_scale *= transform.scale;
+        let previous = (self.paint_linear, self.paint_translation);
+        let local = Mat2::from_angle(transform.rotation) * Mat2::from_diagonal(transform.scale);
+        let offset = transform.origin - local * transform.origin + transform.translation;
+        self.paint_translation += self.paint_linear * offset;
+        self.paint_linear *= local;
         let result = paint(self);
-        (self.paint_scale, self.paint_translation) = previous;
+        (self.paint_linear, self.paint_translation) = previous;
         result
     }
 
@@ -329,7 +334,7 @@ impl PaintDom {
         call.indices.extend(indices);
 
         let vertices = mesh.vertices.into_iter().map(|mut vertex| {
-            let logical = vertex.position * self.paint_scale + self.paint_translation;
+            let logical = self.paint_linear * vertex.position + self.paint_translation;
             let mut pos = logical * self.scale_factor;
             pos += self.unscaled_viewport.pos();
 
@@ -338,11 +343,12 @@ impl PaintDom {
             // some geometry, like rounded rectangles.
             //
             // See: https://github.com/SecondHalfGames/yakui/issues/153
-            // Static text keeps pixel snapping; transformed text moves smoothly
+            // Static opaque text keeps pixel snapping; text in motion moves smoothly
             // rather than jumping between whole pixels during an animation.
             if mesh.pipeline == Pipeline::Text
-                && self.paint_scale == Vec2::ONE
+                && self.paint_linear == Mat2::IDENTITY
                 && self.paint_translation == Vec2::ZERO
+                && self.opacity == 1.0
             {
                 pos = pos.round();
             }
@@ -358,11 +364,22 @@ impl PaintDom {
 
     /// Use the given region as the clipping rect for all following paint calls.
     fn push_clip(&mut self, region: Rect) {
-        let a = region.pos() * self.paint_scale + self.paint_translation;
-        let b = (region.pos() + region.size()) * self.paint_scale + self.paint_translation;
+        let corners = [
+            region.pos(),
+            region.pos() + Vec2::new(region.size().x, 0.),
+            region.pos() + Vec2::new(0., region.size().y),
+            region.max(),
+        ];
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
+        for corner in corners {
+            let transformed = self.paint_linear * corner + self.paint_translation;
+            min = min.min(transformed);
+            max = max.max(transformed);
+        }
         let mut unscaled = Rect::from_pos_size(
-            a.min(b) * self.scale_factor + self.unscaled_viewport.pos(),
-            (b - a).abs() * self.scale_factor,
+            min * self.scale_factor + self.unscaled_viewport.pos(),
+            (max - min) * self.scale_factor,
         );
 
         if let Some(previous) = self.clip_stack.last() {

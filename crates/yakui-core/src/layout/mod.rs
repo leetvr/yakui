@@ -80,13 +80,24 @@ impl LayoutDom {
     /// geometry for paint (for example, during an overlay exit animation).
     /// The owning widget must also reject navigation and restore focus as needed.
     pub fn disable_input(&mut self, dom: &Dom, id: WidgetId) {
-        if let Some(node) = self.get_mut(id) {
-            node.event_interest = EventInterest::empty();
+        fn disable_nodes(layout: &mut LayoutDom, dom: &Dom, id: WidgetId) {
+            if let Some(node) = layout.get_mut(id) {
+                node.event_interest = EventInterest::empty();
+            }
+            for &child in &dom.get(id).unwrap().children {
+                disable_nodes(layout, dom, child);
+            }
         }
-        self.interest_mouse.remove(id);
-        for &child in &dom.get(id).unwrap().children {
-            self.disable_input(dom, child);
-        }
+        disable_nodes(self, dom, id);
+        // Prune the pointer registry once, rather than once per descendant. Long
+        // selectors can retain hundreds of rows during exit; repeated scans here
+        // would turn a normal closing animation into quadratic layout work.
+        let nodes = &self.nodes;
+        self.interest_mouse.retain(|id| {
+            nodes
+                .get(id.index())
+                .is_some_and(|node| node.event_interest.intersects(EventInterest::MOUSE_ALL))
+        });
     }
 
     /// Set the viewport of the DOM in unscaled units.
