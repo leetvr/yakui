@@ -22,5 +22,5 @@ image = { workspace = true, features = ["jpeg", "png"] }
 ash = { workspace = true, features = ["loaded"] }
 ash-window.workspace = true
 
-winit.workspace = true
+winit = { workspace = true, features = ["rwh_06"] }
 raw-window-handle.workspace = true

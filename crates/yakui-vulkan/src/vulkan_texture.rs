@@ -1,9 +1,9 @@
-use std::{collections::VecDeque, mem};
+use std::collections::VecDeque;
 
 use ash::vk;
 use yakui_core as yakui;
 
-use crate::{buffer::Buffer, descriptors::Descriptors, vulkan_context::VulkanContext};
+use crate::{buffer::Buffer, descriptors::Descriptors, vulkan_context::VulkanContext, Vertex};
 
 pub(crate) const NO_TEXTURE_ID: u32 = u32::MAX;
 
@@ -55,6 +55,9 @@ impl VulkanTexture {
     /// [`super::YakuiVulkan::create_user_texture()`].
     ///
     /// ## Safety
+    /// Takes ownership of the image, its memory and its view. They are destroyed
+    /// when the texture is removed and its final frame completes, or at cleanup.
+    ///
     /// - All Vulkan handles must have been created on the same `vulkan_context`
     pub fn from_image(
         vulkan_context: &VulkanContext,
@@ -202,8 +205,9 @@ fn get_address_mode(yakui_address_mode: yakui::paint::AddressMode) -> vk::Sample
 
 #[derive(Default)]
 pub(crate) struct UploadQueue {
-    phase: UploadPhase,
-    in_flight: VecDeque<UploadPhase>,
+    phase: FrameResources,
+    in_flight: VecDeque<FrameResources>,
+    available: Vec<FrameResources>,
     textures: Vec<(vk::Image, vk::Extent2D, vk::Buffer, usize)>,
     pre_barriers: Vec<vk::ImageMemoryBarrier<'static>>,
     post_barriers: Vec<vk::ImageMemoryBarrier<'static>>,
@@ -214,23 +218,74 @@ impl UploadQueue {
         Self::default()
     }
 
-    /// Call when a draw command buffer has begun execution
+    /// Seal all resources recorded for this frame. Further writes use another slot.
     pub fn phase_submitted(&mut self) {
-        let phase = mem::take(&mut self.phase);
+        assert!(
+            self.textures.is_empty(),
+            "record pending texture uploads before submission"
+        );
+        let next = self.available.pop().unwrap_or_default();
+        let phase = std::mem::replace(&mut self.phase, next);
         self.in_flight.push_back(phase);
     }
 
-    /// Call whenever a draw command buffer has completed execution
-    pub unsafe fn phase_executed(&mut self, vulkan_context: &VulkanContext) {
-        let mut finished = self.in_flight.pop_front().expect("no commands in flight");
-        // TODO: Reuse
-        finished.cleanup(vulkan_context.device);
+    /// The host has waited for all transfer and drawing work in the oldest frame.
+    pub unsafe fn phase_executed(
+        &mut self,
+        context: &VulkanContext,
+        descriptors: &mut Descriptors,
+    ) {
+        let mut finished = self.in_flight.pop_front().expect("no frames in flight");
+        for texture in finished.graveyard.drain(..) {
+            texture.cleanup(context.device);
+            descriptors.release_texture(texture.id);
+        }
+        finished.geometry_used = 0;
+        finished.staging_used = 0;
+        for (_, fill) in &mut finished.buffers {
+            *fill = 0;
+        }
+        self.available.push(finished);
     }
 
-    /// Schedule `texture` to be disposed of after the previous phase completes
+    /// Retire after this frame, including any already-recorded uploads/draws.
     pub unsafe fn dispose(&mut self, texture: VulkanTexture) {
-        let phase = self.in_flight.back_mut().unwrap_or(&mut self.phase);
-        phase.graveyard.push(texture);
+        // Frames are submitted and completed in order on the host's graphics
+        // queue. Waiting for this frame also covers earlier uses of the texture.
+        self.phase.graveyard.push(texture);
+    }
+
+    pub unsafe fn geometry(
+        &mut self,
+        context: &VulkanContext,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> (vk::Buffer, vk::Buffer) {
+        let index = self.phase.geometry_used;
+        if index == self.phase.geometry.len() {
+            self.phase.geometry.push(GeometryBuffers {
+                vertices: Buffer::with_capacity(
+                    context,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    vertices.len(),
+                ),
+                indices: Buffer::with_capacity(
+                    context,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    indices.len(),
+                ),
+            });
+        }
+        let pair = &mut self.phase.geometry[index];
+        // This pair has not been used in this frame. Earlier frames cannot own
+        // it because only GPU-completed slots enter the available pool. A second
+        // paint call receives another pair so it cannot overwrite recorded data.
+        pair.vertices.reserve(context, vertices.len());
+        pair.indices.reserve(context, indices.len());
+        pair.vertices.write(0, vertices);
+        pair.indices.write(0, indices);
+        self.phase.geometry_used += 1;
+        (pair.vertices.handle, pair.indices.handle)
     }
 
     unsafe fn push(
@@ -244,6 +299,8 @@ impl UploadQueue {
             dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
             new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             image,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 level_count: 1,
@@ -260,6 +317,8 @@ impl UploadQueue {
             old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             image,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 level_count: 1,
@@ -316,47 +375,62 @@ impl UploadQueue {
 
     pub unsafe fn cleanup(&mut self, device: &ash::Device) {
         self.phase.cleanup(device);
-        while let Some(mut phase) = self.in_flight.pop_front() {
+        for mut phase in self.in_flight.drain(..).chain(self.available.drain(..)) {
             phase.cleanup(device);
         }
     }
 }
 
 #[derive(Default)]
-struct UploadPhase {
+struct FrameResources {
     buffers: Vec<(Buffer<u8>, usize)>,
+    staging_used: usize,
+    geometry: Vec<GeometryBuffers>,
+    geometry_used: usize,
     graveyard: Vec<VulkanTexture>,
 }
 
-impl UploadPhase {
+struct GeometryBuffers {
+    vertices: Buffer<Vertex>,
+    indices: Buffer<u32>,
+}
+
+impl FrameResources {
     unsafe fn cleanup(&mut self, device: &ash::Device) {
-        for (buffer, _) in &self.buffers {
+        for (buffer, _) in self.buffers.drain(..) {
             buffer.cleanup(device);
         }
-        for texture in &self.graveyard {
+        for pair in self.geometry.drain(..) {
+            pair.vertices.cleanup(device);
+            pair.indices.cleanup(device);
+        }
+        for texture in self.graveyard.drain(..) {
             texture.cleanup(device);
         }
     }
 
-    unsafe fn push(&mut self, vulkan_context: &VulkanContext, data: &[u8]) -> (vk::Buffer, usize) {
-        if self
-            .buffers
-            .last()
-            .is_none_or(|(buffer, fill)| fill + data.len() > buffer.capacity())
-        {
-            self.buffers.push((
-                Buffer::with_capacity(
-                    vulkan_context,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                    data.len().max(1024 * 1024),
-                ),
-                0,
-            ));
+    unsafe fn push(&mut self, context: &VulkanContext, data: &[u8]) -> (vk::Buffer, usize) {
+        loop {
+            let index = self.staging_used;
+            if index == self.buffers.len() {
+                self.buffers.push((
+                    Buffer::with_capacity(context, vk::BufferUsageFlags::TRANSFER_SRC, data.len()),
+                    0,
+                ));
+            }
+            let (buffer, fill) = &mut self.buffers[index];
+            // Image copy offsets must be four-byte aligned, even for odd-sized
+            // R8 images. Never relocate a chunk referenced by an earlier copy.
+            let start = (*fill + 3) & !3;
+            if *fill == 0 {
+                buffer.reserve(context, data.len());
+            }
+            if start + data.len() <= buffer.capacity() {
+                *fill = start + data.len();
+                buffer.write(start, data);
+                return (buffer.handle, start);
+            }
+            self.staging_used += 1;
         }
-        let (buffer, offset) = self.buffers.last_mut().unwrap();
-        let start = *offset;
-        *offset += data.len();
-        buffer.write(vulkan_context, start, data);
-        (buffer.handle, start)
     }
 }
