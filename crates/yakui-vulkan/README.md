@@ -63,3 +63,9 @@ It checks rendered pixels with three gated frames in flight, multiple paints per
 frame, geometry growth beyond 10 MiB, aligned odd-sized R8 uploads, staging growth,
 and more texture allocations than the descriptor pool's capacity. It enables
 synchronization validation and fails on any validation error.
+
+Paint opacity is carried independently of color alpha and is applied to the final
+premultiplied fragment color. The renderer blends with `ONE, ONE_MINUS_SRC_ALPHA`
+for both color and alpha. Yakui-managed textures preserve their declared alpha
+convention; mark user data with `VulkanTextureCreateInfo::premultiplied(true)`
+when RGB already includes alpha.

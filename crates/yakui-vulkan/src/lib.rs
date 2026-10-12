@@ -91,6 +91,7 @@ impl PushConstant {
 enum Workflow {
     Main,
     Text,
+    MainPremultiplied,
 }
 
 unsafe impl bytemuck::Zeroable for Workflow {}
@@ -111,6 +112,7 @@ struct Vertex {
     position: yakui_core::geometry::Vec2,
     texcoord: yakui_core::geometry::Vec2,
     color: yakui_core::geometry::Vec4,
+    opacity: f32,
 }
 
 impl From<&YakuiVertex> for Vertex {
@@ -119,6 +121,7 @@ impl From<&YakuiVertex> for Vertex {
             position: y.position,
             texcoord: y.texcoord,
             color: y.color,
+            opacity: y.opacity,
         }
     }
 }
@@ -215,6 +218,12 @@ impl YakuiVulkan {
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: bytemuck::offset_of!(Vertex, color) as _,
             },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 0,
+                format: vk::Format::R32_SFLOAT,
+                offset: bytemuck::offset_of!(Vertex, opacity) as _,
+            },
         ];
 
         let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default()
@@ -256,11 +265,11 @@ impl YakuiVulkan {
         };
         let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
             blend_enable: 1,
-            src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
+            src_color_blend_factor: vk::BlendFactor::ONE,
             dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             color_blend_op: vk::BlendOp::ADD,
             src_alpha_blend_factor: vk::BlendFactor::ONE,
-            dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+            dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             alpha_blend_op: vk::BlendOp::ADD,
             color_write_mask: vk::ColorComponentFlags::RGBA,
         }];
@@ -671,28 +680,29 @@ impl YakuiVulkan {
                 vertices.push(vertex.into())
             }
 
-            let texture_id = call
-                .texture
-                .and_then(|id| match id {
-                    yakui_core::TextureId::Managed(managed) => {
-                        let texture = self.yakui_managed_textures.get(&managed)?;
-                        Some(texture.id)
-                    }
-                    yakui_core::TextureId::User(bits) => {
-                        let texture = self
-                            .user_textures
-                            .get(thunderdome::Index::from_bits(bits)?)?;
-                        Some(texture.id)
-                    }
-                })
-                .unwrap_or(NO_TEXTURE_ID);
+            let texture = call.texture.and_then(|id| match id {
+                yakui_core::TextureId::Managed(managed) => {
+                    self.yakui_managed_textures.get(&managed)
+                }
+                yakui_core::TextureId::User(bits) => {
+                    self.user_textures.get(thunderdome::Index::from_bits(bits)?)
+                }
+            });
+            let texture_id = texture.map_or(NO_TEXTURE_ID, |texture| texture.id);
+            let workflow = if call.pipeline == yakui_core::paint::Pipeline::Main
+                && texture.is_some_and(|texture| texture.premultiplied)
+            {
+                Workflow::MainPremultiplied
+            } else {
+                call.pipeline.into()
+            };
 
             draw_calls.push(DrawCall {
                 index_offset,
                 index_count,
                 clip: call.clip,
                 texture_id,
-                workflow: call.pipeline.into(),
+                workflow,
             });
         }
 

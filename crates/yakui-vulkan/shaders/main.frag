@@ -2,9 +2,11 @@
 #define NO_TEXTURE 4294967295
 #define WORKFLOW_MAIN 0
 #define WORKFLOW_TEXT 1
+#define WORKFLOW_MAIN_PREMULTIPLIED 2
 
 layout (location = 0) in vec4 in_color;
 layout (location = 1) in vec2 in_uv;
+layout (location = 2) in float in_opacity;
 layout (location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D textures[1000];
@@ -15,7 +17,7 @@ layout(push_constant) uniform push_constants {
 
 void main() {
     if (texture_id == NO_TEXTURE) {
-        out_color = in_color;
+        out_color = vec4(in_color.rgb * in_color.a, in_color.a) * in_opacity;
         return;
     } 
     
@@ -31,6 +33,12 @@ void main() {
         }
     } else {
         vec4 user_texture = texture(textures[texture_id], in_uv);
-        out_color = in_color * user_texture;
+        vec4 color = in_color * user_texture;
+        if (workflow == WORKFLOW_MAIN_PREMULTIPLIED) {
+            out_color = vec4(color.rgb * in_color.a, color.a);
+        } else {
+            out_color = vec4(color.rgb * color.a, color.a);
+        }
     }
+    out_color *= in_opacity;
 }

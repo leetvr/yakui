@@ -7,11 +7,12 @@ mod dynamic_scope;
 mod root;
 
 use std::any::{type_name, TypeId};
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::VecDeque;
 use std::mem::replace;
 use std::panic::Location;
 use std::rc::Rc;
+use std::time::Instant;
 
 use anymap::AnyMap;
 use thunderdome::Arena;
@@ -36,6 +37,7 @@ struct DomInner {
     root: WidgetId,
     globals: RefCell<AnyMap>,
     dynamic_scope: DynamicScope,
+    frame_time: Cell<Instant>,
 }
 
 /// A node in the [`Dom`].
@@ -80,11 +82,18 @@ impl Dom {
     pub fn start(&self) {
         log::debug!("Dom::start()");
 
+        self.inner.frame_time.set(Instant::now());
         self.inner.dynamic_scope.clear();
 
         let mut nodes = self.inner.nodes.borrow_mut();
         let root = nodes.get_mut(self.inner.root.index()).unwrap();
         root.next_child = 0;
+    }
+
+    /// Monotonic timestamp captured once at the start of this frame. All widgets
+    /// can sample animations against the same time without frame-rate coupling.
+    pub fn frame_time(&self) -> Instant {
+        self.inner.frame_time.get()
     }
 
     /// End the DOM's build phase.
@@ -287,6 +296,7 @@ impl DomInner {
             stack: RefCell::new(Vec::new()),
             root: WidgetId::new(root),
             dynamic_scope: DynamicScope::new(),
+            frame_time: Cell::new(Instant::now()),
         }
     }
 }

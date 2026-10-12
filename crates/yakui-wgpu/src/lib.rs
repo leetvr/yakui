@@ -64,6 +64,8 @@ struct Vertex {
     pos: Vec2,
     texcoord: Vec2,
     color: Vec4,
+    opacity: f32,
+    padding: [f32; 3],
 }
 
 impl Vertex {
@@ -74,6 +76,7 @@ impl Vertex {
             0 => Float32x2,
             1 => Float32x2,
             2 => Float32x4,
+            3 => Float32,
         ],
     };
 }
@@ -422,6 +425,8 @@ impl YakuiWgpu {
                     pos: vertex.position,
                     texcoord: vertex.texcoord,
                     color: vertex.color,
+                    opacity: vertex.opacity,
+                    padding: [0.0; 3],
                 });
 
                 let base = buffers.vertices.len() as u32;

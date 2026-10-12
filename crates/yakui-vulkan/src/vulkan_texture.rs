@@ -14,6 +14,7 @@ pub struct VulkanTexture {
     pub(crate) sampler: vk::Sampler,
     pub(crate) view: vk::ImageView,
     pub(crate) id: u32,
+    pub(crate) premultiplied: bool,
 }
 
 /// A container for information about a texture.
@@ -26,6 +27,7 @@ pub struct VulkanTextureCreateInfo<T> {
     min_filter: vk::Filter,
     mag_filter: vk::Filter,
     address_mode: vk::SamplerAddressMode,
+    premultiplied: bool,
 }
 
 impl<T: AsRef<[u8]>> VulkanTextureCreateInfo<T> {
@@ -46,7 +48,13 @@ impl<T: AsRef<[u8]>> VulkanTextureCreateInfo<T> {
             min_filter,
             mag_filter,
             address_mode,
+            premultiplied: false,
         }
+    }
+    /// Indicate that RGB already includes alpha. Defaults to straight alpha.
+    pub fn premultiplied(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
     }
 }
 
@@ -90,6 +98,7 @@ impl VulkanTexture {
             sampler,
             view,
             id,
+            premultiplied: false,
         }
     }
 
@@ -106,6 +115,7 @@ impl VulkanTexture {
             min_filter,
             mag_filter,
             address_mode,
+            premultiplied,
         } = create_info;
 
         let (image, memory) = unsafe { vulkan_context.create_image(resolution, format) };
@@ -138,6 +148,7 @@ impl VulkanTexture {
             view,
             sampler,
             id,
+            premultiplied,
         }
     }
 
@@ -168,7 +179,8 @@ impl VulkanTexture {
                 min_filter,
                 mag_filter,
                 address_mode,
-            ),
+            )
+            .premultiplied(texture.format() == yakui::paint::TextureFormat::Rgba8SrgbPremultiplied),
             queue,
         )
     }

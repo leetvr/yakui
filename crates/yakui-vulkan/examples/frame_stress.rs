@@ -33,12 +33,27 @@ unsafe extern "system" fn validation(
     vk::FALSE
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Quad {
     color: [f32; 4],
     right: bool,
     large: bool,
     texture: Option<TextureId>,
+    opacity: f32,
+    text: bool,
+}
+
+impl Default for Quad {
+    fn default() -> Self {
+        Self {
+            color: [1.0; 4],
+            right: false,
+            large: false,
+            texture: None,
+            opacity: 1.0,
+            text: false,
+        }
+    }
 }
 
 impl Widget for Quad {
@@ -68,9 +83,17 @@ impl Widget for Quad {
             if self.large {
                 data.resize(20_000, vertices[0]);
             }
-            let mut mesh = PaintMesh::new(data, [0, 1, 2, 0, 2, 3]);
+            for vertex in &mut data {
+                vertex.opacity = self.opacity;
+            }
+            let indices = if index == 0 {
+                vec![0, 1, 2, 0, 2, 3]
+            } else {
+                Vec::new()
+            };
+            let mut mesh = PaintMesh::new(data, indices);
             mesh.texture = self.texture.map(|id| (id, Rect::ONE));
-            if index % 2 == 1 {
+            if self.text || index % 2 == 1 {
                 mesh.pipeline = Pipeline::Text;
             }
             ctx.paint.add_mesh(mesh);
@@ -399,10 +422,15 @@ unsafe fn run() {
                 &[],
             );
             let right = color(number + 1);
+            let texture_pixels = if batch % 3 == 1 {
+                right.map(|c| (c as f32 * 0.5).round() as u8)
+            } else {
+                right
+            };
             let texture = renderer.create_user_texture(
                 &context,
                 VulkanTextureCreateInfo::new(
-                    right.to_vec(),
+                    texture_pixels.to_vec(),
                     vk::Format::R8G8B8A8_UNORM,
                     vk::Extent2D {
                         width: 1,
@@ -411,7 +439,8 @@ unsafe fn run() {
                     vk::Filter::NEAREST,
                     vk::Filter::NEAREST,
                     vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                ),
+                )
+                .premultiplied(batch % 3 == 1),
             );
             let mut retired = vec![texture];
             for i in 0..4 {
@@ -442,6 +471,7 @@ unsafe fn run() {
             yak.dom().do_widget::<Quad>(Quad {
                 color: left.map(|c| c as f32 / 255.0),
                 large: batch == 1,
+                opacity: if batch % 2 == 0 { 1.0 } else { 0.5 },
                 ..Default::default()
             });
             yak.finish();
@@ -473,8 +503,14 @@ unsafe fn run() {
             renderer.paint(first, &context, frame.cmd, EXTENT);
             yak.start();
             yak.dom().do_widget::<Quad>(Quad {
-                color: [1.0; 4],
+                color: if batch % 3 == 2 {
+                    [1.0, 1.0, 1.0, 0.0]
+                } else {
+                    [1.0; 4]
+                },
                 right: true,
+                text: batch % 3 == 2,
+                opacity: if batch % 3 == 2 { 0.5 } else { 1.0 },
                 texture: Some(texture),
                 ..Default::default()
             });
@@ -534,14 +570,24 @@ unsafe fn run() {
         for (slot, frame) in frames.iter().enumerate() {
             let pixels = std::slice::from_raw_parts(frame.pixels, 64 * 64 * 4);
             let number = batch * 3 + slot;
+            let left = if batch % 2 == 0 {
+                color(number)
+            } else {
+                color(number).map(|c| (c as f32 * 0.5).round() as u8)
+            };
             assert_eq!(
                 &pixels[(32 * 64 + 16) * 4..][..4],
-                &color(number),
+                &left,
                 "left, frame {number}"
             );
+            let right = if batch % 3 == 0 {
+                color(number + 1)
+            } else {
+                color(number + 1).map(|c| (c as f32 * 0.5).round() as u8)
+            };
             assert_eq!(
                 &pixels[(32 * 64 + 48) * 4..][..4],
-                &color(number + 1),
+                &right,
                 "right, frame {number}"
             );
             renderer.transfers_finished(&context);

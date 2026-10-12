@@ -28,6 +28,28 @@ pub struct PaintLimits {
     pub max_texture_size_3d: u32,
 }
 
+/// An axis-aligned paint transform in logical coordinates. Layout and hit testing
+/// remain unchanged. Scaling occurs about `origin`, followed by `translation`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaintTransform {
+    /// Scale on each axis. The default is one.
+    pub scale: Vec2,
+    /// Translation after scaling, in logical units.
+    pub translation: Vec2,
+    /// Fixed point about which scaling occurs.
+    pub origin: Vec2,
+}
+
+impl Default for PaintTransform {
+    fn default() -> Self {
+        Self {
+            scale: Vec2::ONE,
+            translation: Vec2::ZERO,
+            origin: Vec2::ZERO,
+        }
+    }
+}
+
 /// Contains all information about how to paint the current set of widgets.
 #[derive(Debug)]
 pub struct PaintDom {
@@ -39,6 +61,9 @@ pub struct PaintDom {
 
     layers: PaintLayers,
     clip_stack: Vec<Rect>,
+    paint_scale: Vec2,
+    paint_translation: Vec2,
+    opacity: f32,
 }
 
 /// Stores textures for one or more `PaintDom` instances.
@@ -109,6 +134,9 @@ impl PaintDom {
 
             layers: PaintLayers::new(),
             clip_stack: Vec::new(),
+            paint_scale: Vec2::ONE,
+            paint_translation: Vec2::ZERO,
+            opacity: 1.0,
         }
     }
 
@@ -134,6 +162,9 @@ impl PaintDom {
     pub fn start(&mut self) {
         self.textures_mut().texture_edits.clear();
         self.clip_stack.clear();
+        self.paint_scale = Vec2::ONE;
+        self.paint_translation = Vec2::ZERO;
+        self.opacity = 1.0;
     }
 
     /// Returns the size of the surface that is being painted onto.
@@ -152,6 +183,33 @@ impl PaintDom {
 
     pub(crate) fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
+    }
+
+    /// Apply a transform to all geometry and descendant clips painted by `paint`.
+    /// Nested transforms compose in parent/child order. This does not affect
+    /// layout, focus or pointer bounds; animate those through widget layout.
+    pub fn with_transform<R>(
+        &mut self,
+        transform: PaintTransform,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = (self.paint_scale, self.paint_translation);
+        let offset = transform.origin * (Vec2::ONE - transform.scale) + transform.translation;
+        self.paint_translation += self.paint_scale * offset;
+        self.paint_scale *= transform.scale;
+        let result = paint(self);
+        (self.paint_scale, self.paint_translation) = previous;
+        result
+    }
+
+    /// Multiply independent vertex opacity for the duration of `paint`.
+    /// Nested scopes multiply. Zero opacity preserves text color-glyph semantics.
+    pub fn with_opacity<R>(&mut self, opacity: f32, paint: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.opacity;
+        self.opacity *= opacity.clamp(0.0, 1.0);
+        let result = paint(self);
+        self.opacity = previous;
+        result
     }
 
     /// Paint a specific widget. This function is usually called as part of an
@@ -271,7 +329,8 @@ impl PaintDom {
         call.indices.extend(indices);
 
         let vertices = mesh.vertices.into_iter().map(|mut vertex| {
-            let mut pos = vertex.position * self.scale_factor;
+            let logical = vertex.position * self.paint_scale + self.paint_translation;
+            let mut pos = logical * self.scale_factor;
             pos += self.unscaled_viewport.pos();
 
             // Currently, we only round the vertices of geometry fed to the text
@@ -279,13 +338,19 @@ impl PaintDom {
             // some geometry, like rounded rectangles.
             //
             // See: https://github.com/SecondHalfGames/yakui/issues/153
-            if mesh.pipeline == Pipeline::Text {
+            // Static text keeps pixel snapping; transformed text moves smoothly
+            // rather than jumping between whole pixels during an animation.
+            if mesh.pipeline == Pipeline::Text
+                && self.paint_scale == Vec2::ONE
+                && self.paint_translation == Vec2::ZERO
+            {
                 pos = pos.round();
             }
 
             pos /= self.surface_size;
 
             vertex.position = pos;
+            vertex.opacity *= self.opacity;
             vertex
         });
         call.vertices.extend(vertices);
@@ -293,9 +358,11 @@ impl PaintDom {
 
     /// Use the given region as the clipping rect for all following paint calls.
     fn push_clip(&mut self, region: Rect) {
+        let a = region.pos() * self.paint_scale + self.paint_translation;
+        let b = (region.pos() + region.size()) * self.paint_scale + self.paint_translation;
         let mut unscaled = Rect::from_pos_size(
-            region.pos() * self.scale_factor,
-            region.size() * self.scale_factor,
+            a.min(b) * self.scale_factor + self.unscaled_viewport.pos(),
+            (b - a).abs() * self.scale_factor,
         );
 
         if let Some(previous) = self.clip_stack.last() {
