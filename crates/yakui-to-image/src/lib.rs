@@ -20,6 +20,8 @@ pub fn paint_and_save_to<P: AsRef<Path>>(state: &mut yakui_core::Yakui, path: P)
     file.flush().unwrap();
 }
 
+/// Render at the physical viewport size with 4× multisample antialiasing.
+/// Set the Yakui scale factor and physical viewport before layout for HiDPI output.
 pub fn paint(state: &mut yakui_core::Yakui) -> RgbaImage {
     let graphics = pollster::block_on(Graphics::new());
     let mut renderer = yakui_wgpu::YakuiWgpu::new(graphics.device.clone(), graphics.queue.clone());

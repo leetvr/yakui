@@ -28,6 +28,9 @@ impl Multisampling {
     ) -> SurfaceInfo<'a> {
         if size != self.size || format != self.format || sample_count != self.sample_count {
             self.ms_view = None;
+            self.size = size;
+            self.format = format;
+            self.sample_count = sample_count;
         }
 
         if sample_count == 1 {
