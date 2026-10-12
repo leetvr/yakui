@@ -109,18 +109,19 @@ impl From<yakui_core::paint::Pipeline> for Workflow {
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 struct Vertex {
-    position: yakui_core::geometry::Vec2,
-    texcoord: yakui_core::geometry::Vec2,
-    color: yakui_core::geometry::Vec4,
+    // Vulkan vertex attributes need four-byte alignment; avoid SIMD padding.
+    position: [f32; 2],
+    texcoord: [f32; 2],
+    color: [f32; 4],
     opacity: f32,
 }
 
 impl From<&YakuiVertex> for Vertex {
     fn from(y: &YakuiVertex) -> Self {
         Self {
-            position: y.position,
-            texcoord: y.texcoord,
-            color: y.color,
+            position: y.position.to_array(),
+            texcoord: y.texcoord.to_array(),
+            color: y.color.to_array(),
             opacity: y.opacity,
         }
     }

@@ -16,7 +16,7 @@ use buffer::Buffer;
 use bytemuck::{Pod, Zeroable};
 use glam::UVec2;
 use thunderdome::{Arena, Index};
-use yakui_core::geometry::{Rect, Vec2, Vec4};
+use yakui_core::geometry::{Rect, Vec2};
 use yakui_core::paint::{PaintDom, PaintLimits, Pipeline, Texture, TextureChange, TextureFormat};
 use yakui_core::{ManagedTextureId, TextureId};
 
@@ -61,11 +61,12 @@ pub struct SurfaceInfo<'a> {
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]
 #[repr(C)]
 struct Vertex {
-    pos: Vec2,
-    texcoord: Vec2,
-    color: Vec4,
+    // GPU attributes need four-byte alignment, not glam's SIMD alignment.
+    // Arrays keep the upload stride at 36 bytes rather than adding SIMD padding.
+    pos: [f32; 2],
+    texcoord: [f32; 2],
+    color: [f32; 4],
     opacity: f32,
-    padding: [f32; 3],
 }
 
 impl Vertex {
@@ -422,11 +423,10 @@ impl YakuiWgpu {
             .flat_map(|layer| &layer.calls)
             .map(|call| {
                 let vertices = call.vertices.iter().map(|vertex| Vertex {
-                    pos: vertex.position,
-                    texcoord: vertex.texcoord,
-                    color: vertex.color,
+                    pos: vertex.position.to_array(),
+                    texcoord: vertex.texcoord.to_array(),
+                    color: vertex.color.to_array(),
                     opacity: vertex.opacity,
-                    padding: [0.0; 3],
                 });
 
                 let base = buffers.vertices.len() as u32;
