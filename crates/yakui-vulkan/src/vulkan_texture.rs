@@ -9,8 +9,9 @@ pub(crate) const NO_TEXTURE_ID: u32 = u32::MAX;
 
 /// A container around a Vulkan created texture
 pub struct VulkanTexture {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
+    // None means the host owns the image, allocation AND view. Yakui still
+    // owns this wrapper's sampler and descriptor slot until frame retirement.
+    owned: Option<(vk::Image, vk::DeviceMemory)>,
     pub(crate) sampler: vk::Sampler,
     pub(crate) view: vk::ImageView,
     pub(crate) id: u32,
@@ -74,6 +75,37 @@ impl VulkanTexture {
         memory: vk::DeviceMemory,
         view: vk::ImageView,
     ) -> Self {
+        Self::from_view(vulkan_context, descriptors, view, Some((image, memory)))
+    }
+
+    /// Register a host-owned sampled image view without taking its allocation.
+    /// Yakui owns the sampler and descriptor slot; removal retires those only.
+    ///
+    /// # Safety
+    /// The view must belong to this device and support sampling. The host must
+    /// keep its image, allocation and view alive until every frame using this
+    /// registration has finished, including the frame that removes it. The image
+    /// must be in SHADER_READ_ONLY_OPTIMAL when sampled by Yakui.
+    pub unsafe fn borrowed_view(
+        context: &VulkanContext,
+        descriptors: &mut Descriptors,
+        view: vk::ImageView,
+    ) -> Self {
+        Self::from_view(context, descriptors, view, None)
+    }
+
+    /// Specify the alpha convention for imported images (straight by default).
+    pub fn premultiplied(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
+    }
+
+    fn from_view(
+        vulkan_context: &VulkanContext,
+        descriptors: &mut Descriptors,
+        view: vk::ImageView,
+        owned: Option<(vk::Image, vk::DeviceMemory)>,
+    ) -> Self {
         let address_mode = vk::SamplerAddressMode::CLAMP_TO_EDGE;
         let filter = vk::Filter::LINEAR;
         let sampler = unsafe {
@@ -93,8 +125,7 @@ impl VulkanTexture {
         let id =
             unsafe { descriptors.update_texture_descriptor_set(view, sampler, vulkan_context) };
         VulkanTexture {
-            image,
-            memory,
+            owned,
             sampler,
             view,
             id,
@@ -143,8 +174,7 @@ impl VulkanTexture {
             unsafe { descriptors.update_texture_descriptor_set(view, sampler, vulkan_context) };
 
         VulkanTexture {
-            image,
-            memory,
+            owned: Some((image, memory)),
             view,
             sampler,
             id,
@@ -187,9 +217,11 @@ impl VulkanTexture {
 
     pub(crate) unsafe fn cleanup(&self, device: &ash::Device) {
         device.destroy_sampler(self.sampler, None);
-        device.destroy_image_view(self.view, None);
-        device.destroy_image(self.image, None);
-        device.free_memory(self.memory, None);
+        if let Some((image, memory)) = self.owned {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(image, None);
+            device.free_memory(memory, None);
+        }
     }
 }
 

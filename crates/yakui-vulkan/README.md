@@ -47,7 +47,10 @@ resources. No empty submissions are needed to initialize the renderer.
 Texture removals/replacements retire their Vulkan handles and descriptor slots
 with the current frame, conservatively covering earlier submitted uses and any
 pending uploads. `remove_user_texture()` follows the same rule. `from_image()`
-takes ownership of the supplied image, allocation and view.
+takes ownership of the supplied image, allocation and view. `borrowed_view()`
+registers a host-owned sampled image without taking those handles. Keep the image
+and view alive until all frames using the registration, including its removal
+frame, have completed. Yakui still owns and retires its sampler/descriptor slot.
 
 Call `cleanup()` before destroying the device. It waits for device idle and
 releases all owned resources. Do not use the renderer afterwards.
@@ -60,7 +63,8 @@ cargo run -p yakui-vulkan --example frame_stress
 ```
 
 It checks rendered pixels with three gated frames in flight, multiple paints per
-frame, geometry growth beyond 10 MiB, aligned odd-sized R8 uploads, staging growth,
+frame, geometry growth beyond 10 MiB, clipped/offscreen draws, straight and
+premultiplied alpha, borrowed image ownership, aligned odd-sized R8 uploads, staging growth,
 and more texture allocations than the descriptor pool's capacity. It enables
 synchronization validation and fails on any validation error.
 

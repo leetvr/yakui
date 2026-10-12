@@ -1,4 +1,4 @@
-//! Real-device regression check: three in-flight frames, two paints per frame,
+//! Real-device regression check: three in-flight frames, five paints per frame,
 //! growing geometry/staging buffers, and more texture allocations than slots.
 //! Run with `cargo run -p yakui-vulkan --example frame_stress`.
 use ash::vk;
@@ -12,7 +12,7 @@ use yakui_core::{
     widget::{LayoutContext, PaintContext, Widget},
     TextureId, Yakui,
 };
-use yakui_vulkan::{Options, VulkanContext, VulkanTextureCreateInfo, YakuiVulkan};
+use yakui_vulkan::{Options, VulkanContext, VulkanTexture, VulkanTextureCreateInfo, YakuiVulkan};
 
 const EXTENT: vk::Extent2D = vk::Extent2D {
     width: 64,
@@ -41,6 +41,7 @@ struct Quad {
     texture: Option<TextureId>,
     opacity: f32,
     text: bool,
+    repeated: bool,
 }
 
 impl Default for Quad {
@@ -52,6 +53,7 @@ impl Default for Quad {
             texture: None,
             opacity: 1.0,
             text: false,
+            repeated: false,
         }
     }
 }
@@ -78,7 +80,13 @@ impl Widget for Quad {
         ];
         // Extra vertices stress allocations without spending millions of pixels
         // on overdraw. The visible quad still exercises the renderer's output.
-        for index in 0..if self.large { 20 } else { 1 } {
+        for index in 0..if self.large {
+            20
+        } else if self.repeated {
+            2
+        } else {
+            1
+        } {
             let mut data = vertices.to_vec();
             if self.large {
                 data.resize(20_000, vertices[0]);
@@ -86,7 +94,7 @@ impl Widget for Quad {
             for vertex in &mut data {
                 vertex.opacity = self.opacity;
             }
-            let indices = if index == 0 {
+            let indices = if index == 0 || self.repeated {
                 vec![0, 1, 2, 0, 2, 3]
             } else {
                 Vec::new()
@@ -98,6 +106,42 @@ impl Widget for Quad {
             }
             ctx.paint.add_mesh(mesh);
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Clip;
+impl Widget for Clip {
+    type Props<'a> = ();
+    type Response = ();
+    fn new() -> Self {
+        Self
+    }
+    fn update(&mut self, _: ()) {}
+    fn layout(&self, ctx: LayoutContext<'_>, constraints: Constraints) -> Vec2 {
+        ctx.layout.enable_clipping(ctx.dom);
+        self.default_layout(ctx, constraints)
+    }
+}
+#[derive(Debug, Default)]
+struct OutsideClip {
+    position: Vec2,
+}
+impl Widget for OutsideClip {
+    type Props<'a> = Vec2;
+    type Response = ();
+    fn new() -> Self {
+        Self::default()
+    }
+    fn update(&mut self, position: Vec2) {
+        self.position = position;
+    }
+    fn layout(&self, mut ctx: LayoutContext<'_>, constraints: Constraints) -> Vec2 {
+        for &child in &ctx.dom.get_current().children {
+            ctx.calculate_layout(child, Constraints::tight(Vec2::splat(8.)));
+            ctx.layout.set_pos(child, self.position);
+        }
+        constraints.constrain(Vec2::splat(64.))
     }
 }
 
@@ -151,7 +195,11 @@ unsafe fn frame(context: &VulkanContext, pool: vk::CommandPool, pass: vk::Render
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC),
+                .usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::SAMPLED,
+                ),
             None,
         )
         .unwrap();
@@ -442,7 +490,12 @@ unsafe fn run() {
                 )
                 .premultiplied(batch % 3 == 1),
             );
-            let mut retired = vec![texture];
+            // Removing an imported host view must leave the framebuffer alive.
+            // This registration is not sampled (its layout belongs to the host).
+            let borrowed =
+                VulkanTexture::borrowed_view(&context, renderer.descriptors(), frame.view);
+            let borrowed = renderer.add_user_texture(borrowed);
+            let mut retired = vec![texture, borrowed];
             for i in 0..4 {
                 // Three odd R8 uploads followed by a larger one exercise aligned
                 // offsets and staging growth on reused frame slots.
@@ -501,6 +554,19 @@ unsafe fn run() {
             );
             device.cmd_set_scissor(frame.cmd, 0, &[EXTENT.into()]);
             renderer.paint(first, &context, frame.cmd, EXTENT);
+            // Leave a valid small scissor behind. The next paint is unclipped
+            // and must reset it even when its first draw has clip=None.
+            yak.start();
+            let outside = yak.dom().begin_widget::<OutsideClip>(Vec2::ZERO);
+            let clip = yak.dom().begin_widget::<Clip>(());
+            yak.dom().do_widget::<Quad>(Quad {
+                color: [0.; 4],
+                ..Default::default()
+            });
+            yak.dom().end_widget::<Clip>(clip.id);
+            yak.dom().end_widget::<OutsideClip>(outside.id);
+            yak.finish();
+            renderer.paint(yak.paint(), &context, frame.cmd, EXTENT);
             yak.start();
             yak.dom().do_widget::<Quad>(Quad {
                 color: if batch % 3 == 2 {
@@ -516,6 +582,23 @@ unsafe fn run() {
             });
             yak.finish();
             renderer.paint(yak.paint(), &context, frame.cmd, EXTENT);
+            // A painter may emit geometry beyond its own clip (text selection
+            // does this routinely). Neither repeated empty clips nor negative
+            // offscreen clips may leak those triangles onto the visible target.
+            for position in [Vec2::new(128., 0.), Vec2::new(-8., 0.)] {
+                yak.start();
+                let outside = yak.dom().begin_widget::<OutsideClip>(position);
+                let clip = yak.dom().begin_widget::<Clip>(());
+                yak.dom().do_widget::<Quad>(Quad {
+                    color: [1., 0., 1., 1.],
+                    repeated: true,
+                    ..Default::default()
+                });
+                yak.dom().end_widget::<Clip>(clip.id);
+                yak.dom().end_widget::<OutsideClip>(outside.id);
+                yak.finish();
+                renderer.paint(yak.paint(), &context, frame.cmd, EXTENT);
+            }
             device.cmd_end_render_pass(frame.cmd);
             device.cmd_copy_image_to_buffer(
                 frame.cmd,
@@ -576,6 +659,11 @@ unsafe fn run() {
                 color(number).map(|c| (c as f32 * 0.5).round() as u8)
             };
             assert_eq!(
+                &pixels[(4 * 64 + 4) * 4..][..4],
+                &left,
+                "offscreen clip leaked, frame {number}"
+            );
+            assert_eq!(
                 &pixels[(32 * 64 + 16) * 4..][..4],
                 &left,
                 "left, frame {number}"
@@ -616,5 +704,5 @@ unsafe fn run() {
         0,
         "Vulkan validation errors"
     );
-    println!("Passed: 336 frames, 3 in flight, 672 paints, 1680 textures, >10 MiB geometry growth, zero validation errors.");
+    println!("Passed: 336 frames, 3 in flight, 1680 paints, 2016 textures, >10 MiB geometry growth, zero validation errors.");
 }

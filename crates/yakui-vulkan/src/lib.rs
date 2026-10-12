@@ -15,7 +15,7 @@ use std::{collections::HashMap, io::Cursor};
 pub use vulkan_context::VulkanContext;
 use vulkan_texture::{UploadQueue, NO_TEXTURE_ID};
 pub use vulkan_texture::{VulkanTexture, VulkanTextureCreateInfo};
-use yakui_core::geometry::UVec2;
+use yakui_core::geometry::{UVec2, Vec2};
 use yakui_core::paint::PaintLimits;
 use yakui_core::{paint::Vertex as YakuiVertex, ManagedTextureId};
 
@@ -42,6 +42,11 @@ pub struct YakuiVulkan {
     /// A wrapper around descriptor set functionality
     descriptors: Descriptors,
     uploads: UploadQueue,
+    // CPU scratch is reused immediately; each paint copies it into its own
+    // frame-owned GPU buffers before another paint can change these vectors.
+    scratch_vertices: Vec<Vertex>,
+    scratch_indices: Vec<u32>,
+    scratch_draw_calls: Vec<DrawCall>,
 }
 
 /// Vulkan configuration
@@ -66,21 +71,18 @@ struct DrawCall {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Zeroable, Pod)]
 /// Push constant used to determine texture and workflow
 struct PushConstant {
     texture_id: u32,
-    workflow: Workflow,
+    workflow: u32,
 }
-
-unsafe impl Zeroable for PushConstant {}
-unsafe impl Pod for PushConstant {}
 
 impl PushConstant {
     pub fn new(texture_id: u32, workflow: Workflow) -> Self {
         Self {
             texture_id,
-            workflow,
+            workflow: workflow as u32,
         }
     }
 }
@@ -93,9 +95,6 @@ enum Workflow {
     Text,
     MainPremultiplied,
 }
-
-unsafe impl bytemuck::Zeroable for Workflow {}
-unsafe impl bytemuck::Pod for Workflow {}
 
 impl From<yakui_core::paint::Pipeline> for Workflow {
     fn from(p: yakui_core::paint::Pipeline) -> Self {
@@ -336,6 +335,9 @@ impl YakuiVulkan {
             yakui_managed_textures: Default::default(),
             initial_textures_synced: false,
             uploads: UploadQueue::new(),
+            scratch_vertices: Vec::new(),
+            scratch_indices: Vec::new(),
+            scratch_draw_calls: Vec::new(),
         }
     }
 
@@ -405,9 +407,19 @@ impl YakuiVulkan {
             return;
         }
 
-        let (draw_calls, vertices, indices) = self.build_draw_calls(paint);
-        let buffers = self.uploads.geometry(vulkan_context, &vertices, &indices);
-        self.render(vulkan_context, resolution, cmd, &draw_calls, buffers);
+        self.build_draw_calls(paint);
+        let buffers = self.uploads.geometry(
+            vulkan_context,
+            &self.scratch_vertices,
+            &self.scratch_indices,
+        );
+        self.render(
+            vulkan_context,
+            resolution,
+            cmd,
+            &self.scratch_draw_calls,
+            buffers,
+        );
     }
 
     /// Render the draw calls we've built up
@@ -430,6 +442,8 @@ impl YakuiVulkan {
                 self.graphics_pipeline,
             );
             let default_scissor = [resolution.into()];
+            // A preceding paint in this render pass may have left a clip active.
+            device.cmd_set_scissor(command_buffer, 0, &default_scissor);
 
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[buffers.0], &[0]);
             device.cmd_bind_index_buffer(command_buffer, buffers.1, 0, vk::IndexType::UINT32);
@@ -444,15 +458,22 @@ impl YakuiVulkan {
             let mut last_clip = None;
             for draw_call in draw_calls {
                 if draw_call.clip != last_clip {
-                    last_clip = draw_call.clip;
-
                     // TODO - do this when processing draw calls
                     match draw_call.clip {
                         Some(rect) => {
-                            let pos = rect.pos().as_uvec2();
-                            let size = rect.size().as_uvec2();
-
-                            let max = (pos + size).min(surface_size);
+                            if rect.size().min_element() <= 0.0 {
+                                continue;
+                            }
+                            // Intersect in signed coordinates before converting
+                            // to pixels; clamping a negative origin first would
+                            // incorrectly retain the entire original width.
+                            let pos = rect.pos().max(Vec2::ZERO).floor().as_uvec2();
+                            let max = rect
+                                .max()
+                                .min(surface_size.as_vec2())
+                                .max(Vec2::ZERO)
+                                .ceil()
+                                .as_uvec2();
                             let size = UVec2::new(
                                 max.x.saturating_sub(pos.x),
                                 max.y.saturating_sub(pos.y),
@@ -486,6 +507,9 @@ impl YakuiVulkan {
                             device.cmd_set_scissor(command_buffer, 0, &default_scissor);
                         }
                     }
+                    // Empty clips never become the cached active scissor, so
+                    // repeated calls with that clip are all skipped.
+                    last_clip = draw_call.clip;
                 }
 
                 // Instead of using different pipelines for text and non-text rendering, we just
@@ -659,26 +683,23 @@ impl YakuiVulkan {
         }
     }
 
-    fn build_draw_calls(
-        &self,
-        paint: &yakui_core::paint::PaintDom,
-    ) -> (Vec<DrawCall>, Vec<Vertex>, Vec<u32>) {
-        let mut vertices: Vec<Vertex> = Default::default();
-        let mut indices: Vec<u32> = Default::default();
-        let mut draw_calls: Vec<DrawCall> = Default::default();
+    fn build_draw_calls(&mut self, paint: &yakui_core::paint::PaintDom) {
+        self.scratch_vertices.clear();
+        self.scratch_indices.clear();
+        self.scratch_draw_calls.clear();
 
         let calls = paint.layers().iter().flat_map(|layer| &layer.calls);
 
         for call in calls {
-            let base = vertices.len() as u32;
-            let index_offset = indices.len() as u32;
+            let base = self.scratch_vertices.len() as u32;
+            let index_offset = self.scratch_indices.len() as u32;
             let index_count = call.indices.len() as u32;
 
             for index in &call.indices {
-                indices.push(*index as u32 + base);
+                self.scratch_indices.push(*index as u32 + base);
             }
             for vertex in &call.vertices {
-                vertices.push(vertex.into())
+                self.scratch_vertices.push(vertex.into())
             }
 
             let texture = call.texture.and_then(|id| match id {
@@ -698,7 +719,7 @@ impl YakuiVulkan {
                 call.pipeline.into()
             };
 
-            draw_calls.push(DrawCall {
+            self.scratch_draw_calls.push(DrawCall {
                 index_offset,
                 index_count,
                 clip: call.clip,
@@ -706,7 +727,5 @@ impl YakuiVulkan {
                 workflow,
             });
         }
-
-        (draw_calls, vertices, indices)
     }
 }

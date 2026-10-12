@@ -346,6 +346,8 @@ impl YakuiWgpu {
             render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
 
             let mut last_clip = None;
+            let extent = paint.surface_size().as_uvec2();
+            render_pass.set_scissor_rect(0, 0, extent.x, extent.y);
 
             let main_pipeline = self.main_pipeline.get(
                 &self.device,
@@ -368,16 +370,23 @@ impl YakuiWgpu {
                 }
 
                 if command.clip != last_clip {
-                    last_clip = command.clip;
-
                     let surface = paint.surface_size().as_uvec2();
 
                     match command.clip {
                         Some(rect) => {
-                            let pos = rect.pos().as_uvec2();
-                            let size = rect.size().as_uvec2();
-
-                            let max = (pos + size).min(surface);
+                            if rect.size().min_element() <= 0.0 {
+                                continue;
+                            }
+                            // Intersect in signed coordinates before converting
+                            // to pixels; clamping a negative origin first would
+                            // incorrectly retain the entire original width.
+                            let pos = rect.pos().max(Vec2::ZERO).floor().as_uvec2();
+                            let max = rect
+                                .max()
+                                .min(surface.as_vec2())
+                                .max(Vec2::ZERO)
+                                .ceil()
+                                .as_uvec2();
                             let size = UVec2::new(
                                 max.x.saturating_sub(pos.x),
                                 max.y.saturating_sub(pos.y),
@@ -396,6 +405,9 @@ impl YakuiWgpu {
                             render_pass.set_scissor_rect(0, 0, surface.x, surface.y);
                         }
                     }
+                    // Empty clips never become the cached active scissor, so
+                    // repeated calls with that clip are all skipped.
+                    last_clip = command.clip;
                 }
 
                 let bindgroup = command
