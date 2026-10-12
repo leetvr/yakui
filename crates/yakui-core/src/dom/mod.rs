@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::mem::replace;
 use std::panic::Location;
 use std::rc::Rc;
-use std::time::Instant;
+use web_time::Instant;
 
 use anymap::AnyMap;
 use thunderdome::Arena;
