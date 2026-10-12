@@ -126,7 +126,13 @@ impl Circle {
     pub fn add(&self, output: &mut PaintDom) {
         let color = self.color.to_linear();
         let mut vertices = Vec::new();
-        let segments = f32::ceil(TAU / 2.0 / f32::acos(1.0 - 0.2 / self.radius));
+        if self.radius <= 0.0 {
+            return;
+        }
+        // Keep the chord error below 0.05 logical pixels. The previous 0.2
+        // tolerance made small controls visibly polygonal even with MSAA.
+        let segments =
+            f32::ceil(TAU / 2.0 / f32::acos(1.0 - 0.05 / self.radius.max(0.05))).max(12.0);
 
         for i in 0..segments as u32 {
             let angle = TAU * (i as f32) / segments;
@@ -242,7 +248,7 @@ impl RoundedRectangle {
         let color = self.color.to_linear();
 
         let max_radius = top_left.max(top_right).max(bottom_left).max(bottom_right);
-        let slices = f32::ceil(TAU / 8.0 / f32::acos(1.0 - 0.2 / max_radius)) as u32;
+        let slices = f32::ceil(TAU / 8.0 / f32::acos(1.0 - 0.05 / max_radius)) as u32;
 
         // 3 rectangles and 4 corners
         let mut vertices = Vec::with_capacity(4 * 3 + (slices + 2) as usize * 4);

@@ -62,6 +62,20 @@ impl Graphics {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Match yakui-app's default antialiasing. Resolve only after painting:
+        // clearing the single-sample output would leave the MSAA samples undefined.
+        let multisampled = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("yakui-to-image multisampled target"),
+            size,
+            mip_level_count: 1,
+            sample_count: 4,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            view_formats: &[],
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        });
+        let multisampled_view = multisampled.create_view(&Default::default());
+
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("yakui-to-image return buffer"),
             size: (buffer_size.padded_bytes_per_row * buffer_size.height) as u64,
@@ -79,7 +93,7 @@ impl Graphics {
             let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &multisampled_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -95,9 +109,9 @@ impl Graphics {
 
         let surface = SurfaceInfo {
             format: self.format,
-            sample_count: 1,
-            color_attachment: &view,
-            resolve_target: None,
+            sample_count: 4,
+            color_attachment: &multisampled_view,
+            resolve_target: Some(&view),
         };
         let mut buffers = yak_renderer.buffers();
         let paint_yak = yak_renderer.paint(yak, &mut buffers, surface);
