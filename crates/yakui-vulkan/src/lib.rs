@@ -589,8 +589,8 @@ impl YakuiVulkan {
     /// before you've cleaned up your [`ash::Device`], or you'll receive warnings from the Vulkan Validation Layers.
     ///
     /// ## Safety
-    /// - After calling this function, this instance will be **unusable**. You **must not** make any further calls on this instance
-    ///   or you will have a terrible time.
+    /// - After calling this function, do not render or allocate with this instance.
+    ///   Only [`Self::memory_stats`] remains available for cleanup diagnostics.
     /// - `device` must be the same [`ash::Device`] used to create this instance.
     pub unsafe fn cleanup(&mut self, device: &ash::Device) {
         device.device_wait_idle().unwrap();
@@ -607,6 +607,7 @@ impl YakuiVulkan {
     }
 
     /// Current backing memory and live allocations, excluding host-imported images.
+    /// This reads no Vulkan handles and remains available after cleanup.
     pub fn memory_stats(&self) -> MemoryStats {
         self.uploads.memory.stats()
     }

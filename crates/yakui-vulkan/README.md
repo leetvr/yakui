@@ -68,7 +68,7 @@ and view alive until all frames using the registration, including its removal
 frame, have completed. Yakui still owns and retires its sampler/descriptor slot.
 
 Call `cleanup()` before destroying the device. It waits for device idle and
-releases all owned resources. Do not use the renderer afterwards.
+releases all owned resources. Only `memory_stats()` remains available afterwards.
 
 See `examples/demo.rs` for a windowed application. Run the real-device regression
 check with Khronos validation installed:
