@@ -8,6 +8,7 @@ pub struct Descriptors {
     pub(crate) set: vk::DescriptorSet,
     pub(crate) layout: vk::DescriptorSetLayout,
     texture_count: u32,
+    free_slots: Vec<u32>,
 }
 
 impl Descriptors {
@@ -64,6 +65,7 @@ impl Descriptors {
             set,
             layout,
             texture_count: 0,
+            free_slots: Vec::new(),
         }
     }
 
@@ -73,7 +75,14 @@ impl Descriptors {
         sampler: vk::Sampler,
         vulkan_context: &VulkanContext,
     ) -> u32 {
-        let texture_id = self.texture_count;
+        // A descriptor remains immutable while any frame can sample it. Slots
+        // reach this list only when the owning texture's retirement frame ends.
+        let texture_id = self.free_slots.pop().unwrap_or_else(|| {
+            assert!(self.texture_count < 1000, "yakui-vulkan texture descriptor capacity exhausted (1000 live or pending textures)");
+            let id = self.texture_count;
+            self.texture_count += 1;
+            id
+        });
         vulkan_context.device.update_descriptor_sets(
             std::slice::from_ref(
                 &vk::WriteDescriptorSet::default()
@@ -90,14 +99,17 @@ impl Descriptors {
             &[],
         );
 
-        self.texture_count += 1;
         texture_id
+    }
+
+    pub(crate) fn release_texture(&mut self, id: u32) {
+        self.free_slots.push(id);
     }
 
     /// ## Safety
     /// Descriptors will be unusable after this function has been called.
     pub unsafe fn cleanup(&self, device: &ash::Device) {
-        device.destroy_descriptor_set_layout(self.layout, None);
         device.destroy_descriptor_pool(self.pool, None);
+        device.destroy_descriptor_set_layout(self.layout, None);
     }
 }

@@ -19,6 +19,7 @@ pub struct ExampleState {
     /// `ManagedTextureId` is a texture owned by yakui. You can create one by
     /// giving yakui some image data; it'll be uploaded by the renderer.
     pub monkey: ManagedTextureId,
+    pub monkey_transparent: ManagedTextureId,
     pub monkey_blurred: ManagedTextureId,
     pub brown_inlay: ManagedTextureId,
 
@@ -26,6 +27,10 @@ pub struct ExampleState {
     /// the renderer. This image is generated in `custom_texture.rs` and
     /// uploaded with wgpu directly.
     pub custom: Option<TextureId>,
+
+    /// Deferred commands to run on the yakui state after the current frame
+    #[allow(clippy::type_complexity)]
+    pub commands: Vec<Box<dyn FnOnce(&mut yakui::Yakui) + 'static>>,
 }
 
 pub trait ExampleBody: 'static {

@@ -1,4 +1,3 @@
-use crate::context;
 use crate::dom::Dom;
 use crate::event::{Event, EventResponse};
 use crate::geometry::{Rect, Vec2};
@@ -6,6 +5,7 @@ use crate::id::ManagedTextureId;
 use crate::input::InputState;
 use crate::layout::LayoutDom;
 use crate::paint::{PaintDom, PaintLimits, Texture};
+use crate::{context, WidgetId};
 
 /// The entrypoint for yakui.
 #[derive(Debug)]
@@ -25,6 +25,14 @@ impl Yakui {
             layout: LayoutDom::new(),
             paint: PaintDom::new(),
             input: InputState::new(),
+        }
+    }
+
+    /// Create a new `Yakui` that shares resources with this one.
+    pub fn fork(&self) -> Self {
+        Self {
+            paint: self.paint.fork(),
+            ..Self::new()
         }
     }
 
@@ -50,11 +58,6 @@ impl Yakui {
         self.paint.add_texture(texture)
     }
 
-    /// Returns an iterator of all textures managed by yakui.
-    pub fn textures(&self) -> impl Iterator<Item = (ManagedTextureId, &Texture)> {
-        self.paint.textures()
-    }
-
     /// Set the size of the surface the yakui is being rendered onto.
     pub fn set_surface_size(&mut self, size: Vec2) {
         self.paint.set_surface_size(size);
@@ -69,6 +72,11 @@ impl Yakui {
     pub fn set_unscaled_viewport(&mut self, view: Rect) {
         self.layout.set_unscaled_viewport(view);
         self.paint.set_unscaled_viewport(view);
+    }
+
+    /// Retrieve the scale factor currently used by yakui.
+    pub fn scale_factor(&self) -> f32 {
+        self.layout.scale_factor()
     }
 
     /// Manually sets the scale factor used for laying out widgets.
@@ -102,7 +110,7 @@ impl Yakui {
     pub fn finish(&mut self) {
         context::unbind_dom();
 
-        self.dom.finish(&self.input);
+        self.dom.finish();
         self.layout.sync_removals(&self.dom.removed_nodes());
         self.layout
             .calculate_all(&self.dom, &self.input, &self.paint);
@@ -141,5 +149,10 @@ impl Yakui {
     /// focused textbox.
     pub fn text_input_enabled(&self) -> bool {
         self.input.text_input_enabled()
+    }
+
+    /// Requests focus of a specific widget, or clears focus if `None`.
+    pub fn request_focus(&mut self, id: Option<WidgetId>) {
+        self.handle_event(Event::RequestFocus(id));
     }
 }

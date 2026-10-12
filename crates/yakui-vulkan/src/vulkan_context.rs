@@ -1,6 +1,6 @@
 use ash::vk;
 
-use crate::util::find_memorytype_index;
+use crate::allocator::{Allocation, Allocator};
 
 #[derive(Clone)]
 /// A wrapper around handles into your Vulkan renderer to call various methods on [`crate::YakuiVulkan`]
@@ -40,9 +40,10 @@ impl<'a> VulkanContext<'a> {
 
     pub(crate) unsafe fn create_image(
         &self,
+        allocator: &mut Allocator,
         extent: vk::Extent2D,
         format: vk::Format,
-    ) -> (vk::Image, vk::DeviceMemory) {
+    ) -> (vk::Image, Allocation) {
         let device = self.device;
 
         let image = device
@@ -63,34 +64,8 @@ impl<'a> VulkanContext<'a> {
             )
             .unwrap();
 
-        let memory_requirements = device.get_image_memory_requirements(image);
-        let memory_index = find_memorytype_index(
-            &memory_requirements,
-            &self.memory_properties,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .expect("Unable to find suitable memory type for image");
-        let image_memory = self.allocate_memory(memory_requirements.size, memory_index);
-        device.bind_image_memory(image, image_memory, 0).unwrap();
-
-        (image, image_memory)
-    }
-
-    unsafe fn allocate_memory(
-        &self,
-        allocation_size: vk::DeviceSize,
-        memory_type_index: u32,
-    ) -> vk::DeviceMemory {
-        self.device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo {
-                    allocation_size,
-                    memory_type_index,
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap()
+        let memory = allocator.image(self, image);
+        (image, memory)
     }
 
     pub(crate) unsafe fn create_image_view(

@@ -1,5 +1,6 @@
 use ash::vk;
 use yakui::geometry::{UVec2, Vec2};
+use yakui::style::TextStyle;
 use yakui_vulkan::*;
 
 use winit::{
@@ -53,8 +54,6 @@ fn main() {
         };
         let mut yakui_vulkan = YakuiVulkan::new(&vulkan_context, options);
         yakui_vulkan.set_paint_limits(&vulkan_context, &mut yak);
-        // Prepare for one frame in flight
-        yakui_vulkan.transfers_submitted();
         let gui_state = GuiState {
             monkey: yak.add_texture(create_yakui_texture(
                 MONKEY_PNG,
@@ -70,6 +69,7 @@ fn main() {
     };
 
     let mut winit_initializing = true;
+    let mut frame_submitted = false;
 
     event_loop.set_control_flow(ControlFlow::Poll);
     #[allow(deprecated)] // winit!! :shakes-fist:
@@ -109,7 +109,10 @@ fn main() {
 
             let index = vulkan_test.cmd_begin();
             unsafe {
-                yakui_vulkan.transfers_finished(&vulkan_context);
+                if frame_submitted {
+                    // cmd_begin waited for the fence covering transfer and paint.
+                    yakui_vulkan.transfers_finished(&vulkan_context);
+                }
                 yakui_vulkan.transfer(paint, &vulkan_context, vulkan_test.draw_command_buffer);
             }
             vulkan_test.render_begin(index);
@@ -123,6 +126,7 @@ fn main() {
             }
             vulkan_test.render_end(index);
             yakui_vulkan.transfers_submitted();
+            frame_submitted = true;
         }
         Event::WindowEvent {
             event: WindowEvent::Resized(size),
@@ -220,9 +224,11 @@ fn gui(gui_state: &GuiState) {
         row(|| {
             label("Hello, world!");
 
-            let mut text = Text::new(48.0, "colored text!");
-            text.style.color = Color::RED;
-            text.show();
+            Text::with_style(
+                "colored text!",
+                TextStyle::label().font_size(48.0).color(Color::RED),
+            )
+            .show();
         });
 
         text(96.0, format!("look it is a {animal}"));

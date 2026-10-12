@@ -1,22 +1,23 @@
 #![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+mod allocator;
 mod buffer;
 mod descriptors;
 mod util;
 mod vulkan_context;
 mod vulkan_texture;
 
+pub use allocator::MemoryStats;
 use ash::util::read_spv;
 pub use ash::vk;
-use buffer::Buffer;
 use bytemuck::{bytes_of, Pod, Zeroable};
 pub use descriptors::Descriptors;
 use std::{collections::HashMap, io::Cursor};
 pub use vulkan_context::VulkanContext;
 use vulkan_texture::{UploadQueue, NO_TEXTURE_ID};
 pub use vulkan_texture::{VulkanTexture, VulkanTextureCreateInfo};
-use yakui_core::geometry::UVec2;
+use yakui_core::geometry::{UVec2, Vec2};
 use yakui_core::paint::PaintLimits;
 use yakui_core::{paint::Vertex as YakuiVertex, ManagedTextureId};
 
@@ -34,10 +35,6 @@ pub struct YakuiVulkan {
     pipeline_layout: vk::PipelineLayout,
     /// The graphics pipeline used to draw
     graphics_pipeline: vk::Pipeline,
-    /// A single index buffer, shared between all draw calls
-    index_buffer: Buffer<u32>,
-    /// A single vertex buffer, shared between all draw calls
-    vertex_buffer: Buffer<Vertex>,
     /// Have we synced the first textures from yakui?
     initial_textures_synced: bool,
     /// Textures owned by yakui
@@ -47,6 +44,11 @@ pub struct YakuiVulkan {
     /// A wrapper around descriptor set functionality
     descriptors: Descriptors,
     uploads: UploadQueue,
+    // CPU scratch is reused immediately; each paint copies it into its own
+    // frame-owned GPU buffers before another paint can change these vectors.
+    scratch_vertices: Vec<Vertex>,
+    scratch_indices: Vec<u32>,
+    scratch_draw_calls: Vec<DrawCall>,
 }
 
 /// Vulkan configuration
@@ -71,21 +73,18 @@ struct DrawCall {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Zeroable, Pod)]
 /// Push constant used to determine texture and workflow
 struct PushConstant {
     texture_id: u32,
-    workflow: Workflow,
+    workflow: u32,
 }
-
-unsafe impl Zeroable for PushConstant {}
-unsafe impl Pod for PushConstant {}
 
 impl PushConstant {
     pub fn new(texture_id: u32, workflow: Workflow) -> Self {
         Self {
             texture_id,
-            workflow,
+            workflow: workflow as u32,
         }
     }
 }
@@ -96,10 +95,8 @@ impl PushConstant {
 enum Workflow {
     Main,
     Text,
+    MainPremultiplied,
 }
-
-unsafe impl bytemuck::Zeroable for Workflow {}
-unsafe impl bytemuck::Pod for Workflow {}
 
 impl From<yakui_core::paint::Pipeline> for Workflow {
     fn from(p: yakui_core::paint::Pipeline) -> Self {
@@ -113,17 +110,20 @@ impl From<yakui_core::paint::Pipeline> for Workflow {
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 struct Vertex {
-    position: yakui_core::geometry::Vec2,
-    texcoord: yakui_core::geometry::Vec2,
-    color: yakui_core::geometry::Vec4,
+    // Vulkan vertex attributes need four-byte alignment; avoid SIMD padding.
+    position: [f32; 2],
+    texcoord: [f32; 2],
+    color: [f32; 4],
+    opacity: f32,
 }
 
 impl From<&YakuiVertex> for Vertex {
     fn from(y: &YakuiVertex) -> Self {
         Self {
-            position: y.position,
-            texcoord: y.texcoord,
-            color: y.color,
+            position: y.position.to_array(),
+            texcoord: y.texcoord.to_array(),
+            color: y.color.to_array(),
+            opacity: y.opacity,
         }
     }
 }
@@ -137,9 +137,6 @@ impl YakuiVulkan {
     pub fn new(vulkan_context: &VulkanContext, options: Options) -> Self {
         let device = vulkan_context.device;
         let descriptors = Descriptors::new(vulkan_context);
-
-        let index_buffer = Buffer::new(vulkan_context, vk::BufferUsageFlags::INDEX_BUFFER, &[]);
-        let vertex_buffer = Buffer::new(vulkan_context, vk::BufferUsageFlags::VERTEX_BUFFER, &[]);
 
         let mut vertex_spv_file = Cursor::new(&include_bytes!("../shaders/main.vert.spv")[..]);
         let mut frag_spv_file = Cursor::new(&include_bytes!("../shaders/main.frag.spv")[..]);
@@ -223,6 +220,12 @@ impl YakuiVulkan {
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: bytemuck::offset_of!(Vertex, color) as _,
             },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 0,
+                format: vk::Format::R32_SFLOAT,
+                offset: bytemuck::offset_of!(Vertex, opacity) as _,
+            },
         ];
 
         let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default()
@@ -264,11 +267,11 @@ impl YakuiVulkan {
         };
         let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
             blend_enable: 1,
-            src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
+            src_color_blend_factor: vk::BlendFactor::ONE,
             dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             color_blend_op: vk::BlendOp::ADD,
             src_alpha_blend_factor: vk::BlendFactor::ONE,
-            dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+            dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             alpha_blend_op: vk::BlendOp::ADD,
             color_write_mask: vk::ColorComponentFlags::RGBA,
         }];
@@ -330,12 +333,13 @@ impl YakuiVulkan {
             descriptors,
             pipeline_layout,
             graphics_pipeline,
-            index_buffer,
-            vertex_buffer,
             user_textures: Default::default(),
             yakui_managed_textures: Default::default(),
             initial_textures_synced: false,
             uploads: UploadQueue::new(),
+            scratch_vertices: Vec::new(),
+            scratch_indices: Vec::new(),
+            scratch_draw_calls: Vec::new(),
         }
     }
 
@@ -353,10 +357,12 @@ impl YakuiVulkan {
         self.uploads.record(vulkan_context, cmd);
     }
 
-    /// Call when commands recorded by zero or more successive `transfer` calls have been submitted to
-    /// a queue
+    /// Seal the current frame after submitting its transfer AND drawing commands.
     ///
-    /// To support N concurrent frames in flight, call this N times before creating any textures.
+    /// Geometry and staging buffers remain exclusively owned by this frame until
+    /// [`Self::transfers_finished`] reports GPU completion. Subsequent recording
+    /// uses another resource slot. Submit frames in order on the context's queue.
+    /// There is no need to pre-seed empty frames.
     pub fn transfers_submitted(&mut self) {
         self.uploads.phase_submitted();
     }
@@ -365,10 +371,14 @@ impl YakuiVulkan {
     ///
     /// ## Safety
     ///
-    /// Those commands recorded prior to the oldest call to `transfers_submitted` not yet associated
-    /// with a call to `transfers_finished` must not be executing.
+    /// The host must have waited on a fence or timeline value covering ALL
+    /// transfer and drawing commands recorded for the oldest outstanding frame.
+    /// Command buffers referencing its resources must not be submitted again.
+    /// Completion notifications must follow submission order, using the same
+    /// device/queue as construction. Transfer completion alone is insufficient.
     pub unsafe fn transfers_finished(&mut self, vulkan_context: &VulkanContext) {
-        self.uploads.phase_executed(vulkan_context);
+        self.uploads
+            .phase_executed(vulkan_context, &mut self.descriptors);
     }
 
     /// Establish limits for yakui's painting logic from the Vulkan context
@@ -399,9 +409,19 @@ impl YakuiVulkan {
             return;
         }
 
-        let draw_calls = self.build_draw_calls(vulkan_context, paint);
-
-        self.render(vulkan_context, resolution, cmd, &draw_calls);
+        self.build_draw_calls(paint);
+        let buffers = self.uploads.geometry(
+            vulkan_context,
+            &self.scratch_vertices,
+            &self.scratch_indices,
+        );
+        self.render(
+            vulkan_context,
+            resolution,
+            cmd,
+            &self.scratch_draw_calls,
+            buffers,
+        );
     }
 
     /// Render the draw calls we've built up
@@ -411,6 +431,7 @@ impl YakuiVulkan {
         resolution: vk::Extent2D,
         command_buffer: vk::CommandBuffer,
         draw_calls: &[DrawCall],
+        buffers: (vk::Buffer, vk::Buffer),
     ) {
         let device = vulkan_context.device;
 
@@ -423,14 +444,11 @@ impl YakuiVulkan {
                 self.graphics_pipeline,
             );
             let default_scissor = [resolution.into()];
+            // A preceding paint in this render pass may have left a clip active.
+            device.cmd_set_scissor(command_buffer, 0, &default_scissor);
 
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer.handle], &[0]);
-            device.cmd_bind_index_buffer(
-                command_buffer,
-                self.index_buffer.handle,
-                0,
-                vk::IndexType::UINT32,
-            );
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[buffers.0], &[0]);
+            device.cmd_bind_index_buffer(command_buffer, buffers.1, 0, vk::IndexType::UINT32);
             device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -442,15 +460,22 @@ impl YakuiVulkan {
             let mut last_clip = None;
             for draw_call in draw_calls {
                 if draw_call.clip != last_clip {
-                    last_clip = draw_call.clip;
-
                     // TODO - do this when processing draw calls
                     match draw_call.clip {
                         Some(rect) => {
-                            let pos = rect.pos().as_uvec2();
-                            let size = rect.size().as_uvec2();
-
-                            let max = (pos + size).min(surface_size);
+                            if rect.size().min_element() <= 0.0 {
+                                continue;
+                            }
+                            // Intersect in signed coordinates before converting
+                            // to pixels; clamping a negative origin first would
+                            // incorrectly retain the entire original width.
+                            let pos = rect.pos().max(Vec2::ZERO).floor().as_uvec2();
+                            let max = rect
+                                .max()
+                                .min(surface_size.as_vec2())
+                                .max(Vec2::ZERO)
+                                .ceil()
+                                .as_uvec2();
                             let size = UVec2::new(
                                 max.x.saturating_sub(pos.x),
                                 max.y.saturating_sub(pos.y),
@@ -484,6 +509,9 @@ impl YakuiVulkan {
                             device.cmd_set_scissor(command_buffer, 0, &default_scissor);
                         }
                     }
+                    // Empty clips never become the cached active scissor, so
+                    // repeated calls with that clip are all skipped.
+                    last_clip = draw_call.clip;
                 }
 
                 // Instead of using different pipelines for text and non-text rendering, we just
@@ -538,27 +566,50 @@ impl YakuiVulkan {
         yakui_core::TextureId::User(self.user_textures.insert(texture).to_bits())
     }
 
+    /// Remove a user texture and retire its Vulkan resources after this frame.
+    /// Returns false if the ID is managed by Yakui or is no longer registered.
+    /// Submit this frame and report its completion to reclaim the descriptor slot.
+    pub fn remove_user_texture(&mut self, id: yakui_core::TextureId) -> bool {
+        let yakui_core::TextureId::User(bits) = id else {
+            return false;
+        };
+        let Some(index) = thunderdome::Index::from_bits(bits) else {
+            return false;
+        };
+        let Some(texture) = self.user_textures.remove(index) else {
+            return false;
+        };
+        unsafe {
+            self.uploads.dispose(texture);
+        }
+        true
+    }
+
     /// Clean up all Vulkan related handles on this instance. You'll probably want to call this when the program ends, but
     /// before you've cleaned up your [`ash::Device`], or you'll receive warnings from the Vulkan Validation Layers.
     ///
     /// ## Safety
-    /// - After calling this function, this instance will be **unusable**. You **must not** make any further calls on this instance
-    ///   or you will have a terrible time.
+    /// - After calling this function, do not render or allocate with this instance.
+    ///   Only [`Self::memory_stats`] remains available for cleanup diagnostics.
     /// - `device` must be the same [`ash::Device`] used to create this instance.
     pub unsafe fn cleanup(&mut self, device: &ash::Device) {
         device.device_wait_idle().unwrap();
         self.descriptors.cleanup(device);
         for (_, texture) in self.yakui_managed_textures.drain() {
-            texture.cleanup(device);
+            texture.cleanup(device, &mut self.uploads.memory);
         }
         for (_, texture) in self.user_textures.drain() {
-            texture.cleanup(device);
+            texture.cleanup(device, &mut self.uploads.memory);
         }
-        device.destroy_pipeline_layout(self.pipeline_layout, None);
         device.destroy_pipeline(self.graphics_pipeline, None);
-        self.index_buffer.cleanup(device);
-        self.vertex_buffer.cleanup(device);
+        device.destroy_pipeline_layout(self.pipeline_layout, None);
         self.uploads.cleanup(device);
+    }
+
+    /// Current backing memory and live allocations, excluding host-imported images.
+    /// This reads no Vulkan handles and remains available after cleanup.
+    pub fn memory_stats(&self) -> MemoryStats {
+        self.uploads.memory.stats()
     }
 
     /// Provides access to the descriptors used by `YakuiVulkan` to manage textures.
@@ -575,7 +626,9 @@ impl YakuiVulkan {
         use yakui_core::paint::TextureChange;
         if !self.initial_textures_synced {
             self.initial_textures_synced = true;
-            for (id, texture) in paint.textures() {
+            let textures = paint.textures();
+
+            for (id, texture) in textures.iter() {
                 let texture = VulkanTexture::from_yakui_texture(
                     vulkan_context,
                     &mut self.descriptors,
@@ -588,17 +641,23 @@ impl YakuiVulkan {
             return;
         }
 
-        for (id, change) in paint.texture_edits() {
+        let textures = paint.textures();
+
+        for (id, change) in textures.edits() {
             match change {
                 TextureChange::Added => {
-                    let texture = paint.texture(id).unwrap();
+                    let texture = textures.get(id).unwrap();
                     let texture = VulkanTexture::from_yakui_texture(
                         vulkan_context,
                         &mut self.descriptors,
                         texture,
                         &mut self.uploads,
                     );
-                    self.yakui_managed_textures.insert(id, texture);
+                    if let Some(old) = self.yakui_managed_textures.insert(id, texture) {
+                        unsafe {
+                            self.uploads.dispose(old);
+                        }
+                    }
                 }
 
                 TextureChange::Removed => {
@@ -615,72 +674,66 @@ impl YakuiVulkan {
                             self.uploads.dispose(old);
                         }
                     }
-                    let new = paint.texture(id).unwrap();
+                    let new = textures.get(id).unwrap();
                     let texture = VulkanTexture::from_yakui_texture(
                         vulkan_context,
                         &mut self.descriptors,
                         new,
                         &mut self.uploads,
                     );
-                    self.yakui_managed_textures.insert(id, texture);
+                    if let Some(old) = self.yakui_managed_textures.insert(id, texture) {
+                        unsafe {
+                            self.uploads.dispose(old);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn build_draw_calls(
-        &mut self,
-        vulkan_context: &VulkanContext,
-        paint: &yakui_core::paint::PaintDom,
-    ) -> Vec<DrawCall> {
-        let mut vertices: Vec<Vertex> = Default::default();
-        let mut indices: Vec<u32> = Default::default();
-        let mut draw_calls: Vec<DrawCall> = Default::default();
+    fn build_draw_calls(&mut self, paint: &yakui_core::paint::PaintDom) {
+        self.scratch_vertices.clear();
+        self.scratch_indices.clear();
+        self.scratch_draw_calls.clear();
 
         let calls = paint.layers().iter().flat_map(|layer| &layer.calls);
 
         for call in calls {
-            let base = vertices.len() as u32;
-            let index_offset = indices.len() as u32;
+            let base = self.scratch_vertices.len() as u32;
+            let index_offset = self.scratch_indices.len() as u32;
             let index_count = call.indices.len() as u32;
 
             for index in &call.indices {
-                indices.push(*index as u32 + base);
+                self.scratch_indices.push(*index as u32 + base);
             }
             for vertex in &call.vertices {
-                vertices.push(vertex.into())
+                self.scratch_vertices.push(vertex.into())
             }
 
-            let texture_id = call
-                .texture
-                .and_then(|id| match id {
-                    yakui_core::TextureId::Managed(managed) => {
-                        let texture = self.yakui_managed_textures.get(&managed)?;
-                        Some(texture.id)
-                    }
-                    yakui_core::TextureId::User(bits) => {
-                        let texture = self
-                            .user_textures
-                            .get(thunderdome::Index::from_bits(bits)?)?;
-                        Some(texture.id)
-                    }
-                })
-                .unwrap_or(NO_TEXTURE_ID);
+            let texture = call.texture.and_then(|id| match id {
+                yakui_core::TextureId::Managed(managed) => {
+                    self.yakui_managed_textures.get(&managed)
+                }
+                yakui_core::TextureId::User(bits) => {
+                    self.user_textures.get(thunderdome::Index::from_bits(bits)?)
+                }
+            });
+            let texture_id = texture.map_or(NO_TEXTURE_ID, |texture| texture.id);
+            let workflow = if call.pipeline == yakui_core::paint::Pipeline::Main
+                && texture.is_some_and(|texture| texture.premultiplied)
+            {
+                Workflow::MainPremultiplied
+            } else {
+                call.pipeline.into()
+            };
 
-            draw_calls.push(DrawCall {
+            self.scratch_draw_calls.push(DrawCall {
                 index_offset,
                 index_count,
                 clip: call.clip,
                 texture_id,
-                workflow: call.pipeline.into(),
+                workflow,
             });
         }
-
-        unsafe {
-            self.index_buffer.write(vulkan_context, 0, &indices);
-            self.vertex_buffer.write(vulkan_context, 0, &vertices);
-        }
-
-        draw_calls
     }
 }

@@ -18,6 +18,7 @@ impl Graphics {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .unwrap();
@@ -98,7 +99,8 @@ impl Graphics {
             color_attachment: &view,
             resolve_target: None,
         };
-        let paint_yak = yak_renderer.paint(yak, &self.device, &self.queue, surface);
+        let mut buffers = yak_renderer.buffers();
+        let paint_yak = yak_renderer.paint(yak, &mut buffers, surface);
 
         let mut encoder = self
             .device
@@ -133,10 +135,13 @@ impl Graphics {
         });
 
         self.device
-            .poll(wgpu::PollType::WaitForSubmissionIndex(submit_index))
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submit_index),
+                timeout: None,
+            })
             .unwrap();
 
-        let padded_data = buffer_slice.get_mapped_range().to_vec();
+        let padded_data = buffer_slice.get_mapped_range().unwrap();
         let mut data = Vec::new();
         for chunk in padded_data.chunks(buffer_size.padded_bytes_per_row as usize) {
             data.extend(&chunk[..buffer_size.unpadded_bytes_per_row as usize]);

@@ -32,6 +32,12 @@ impl MouseInterest {
         layer.push((id, interest));
     }
 
+    pub fn retain(&mut self, mut keep: impl FnMut(WidgetId) -> bool) {
+        for layer in &mut self.layers {
+            layer.retain(|(widget, _)| keep(*widget));
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (WidgetId, EventInterest)> + '_ {
         self.layers
             .iter()

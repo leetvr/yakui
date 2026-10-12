@@ -2,6 +2,7 @@
 
 mod multisampling;
 
+use wgpu::CurrentSurfaceTexture;
 use winit::{dpi::PhysicalSize, event::WindowEvent, event_loop::ActiveEventLoop, window::Window};
 
 use multisampling::Multisampling;
@@ -20,6 +21,7 @@ pub struct Graphics {
 
     window: yakui_winit::YakuiWinit,
     pub renderer: yakui_wgpu::YakuiWgpu,
+    buffers: yakui_wgpu::Buffers,
     /// Tracks whether winit is still initializing
     pub is_init: bool,
 }
@@ -38,7 +40,7 @@ impl Graphics {
         let instance = wgpu::Instance::default();
         let surface = unsafe {
             instance.create_surface_unsafe(
-                wgpu::SurfaceTargetUnsafe::from_window(&window)
+                wgpu::SurfaceTargetUnsafe::from_display_and_window(&window, &window)
                     .expect("Could not create wgpu surface from window"),
             )
         }
@@ -49,6 +51,7 @@ impl Graphics {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .unwrap();
@@ -58,7 +61,7 @@ impl Graphics {
                 // WebGL doesn't support all of wgpu's features, so if
                 // we're building for the web we'll have to disable some.
                 required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
+                    wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
                 } else {
                     wgpu::Limits::default()
                 },
@@ -78,12 +81,14 @@ impl Graphics {
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
 
         // yakui_wgpu takes paint output from yakui and renders it for us using
         // wgpu.
-        let renderer = yakui_wgpu::YakuiWgpu::new(&device, &queue);
+        let renderer = yakui_wgpu::YakuiWgpu::new(device.clone(), queue.clone());
+        let buffers = renderer.buffers();
 
         // yakui_winit processes winit events and applies them to our yakui
         // state.
@@ -101,6 +106,7 @@ impl Graphics {
             multisampling: Multisampling::new(),
 
             renderer,
+            buffers,
             window,
             is_init: true,
         }
@@ -130,8 +136,10 @@ impl Graphics {
     #[profiling::function]
     pub fn paint(&mut self, yak: &mut yakui::Yakui, bg: wgpu::Color) {
         let output = match self.surface.get_current_texture() {
-            Ok(output) => output,
-            Err(_) => return,
+            CurrentSurfaceTexture::Success(output) | CurrentSurfaceTexture::Suboptimal(output) => {
+                output
+            }
+            _ => return,
         };
 
         let view = output
@@ -170,10 +178,10 @@ impl Graphics {
 
         let clear = encoder.finish();
 
-        let paint_yak = self.renderer.paint(yak, &self.device, &self.queue, surface);
+        let paint_yak = self.renderer.paint(yak, &mut self.buffers, surface);
 
         self.queue.submit([clear, paint_yak]);
-        output.present();
+        self.queue.present(output);
     }
 
     pub fn handle_window_event(

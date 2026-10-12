@@ -1,19 +1,32 @@
-use std::{collections::VecDeque, mem};
+use std::collections::VecDeque;
 
 use ash::vk;
 use yakui_core as yakui;
 
-use crate::{buffer::Buffer, descriptors::Descriptors, vulkan_context::VulkanContext};
+use crate::{
+    allocator::{Allocation, Allocator},
+    buffer::Buffer,
+    descriptors::Descriptors,
+    vulkan_context::VulkanContext,
+    Vertex,
+};
 
 pub(crate) const NO_TEXTURE_ID: u32 = u32::MAX;
 
 /// A container around a Vulkan created texture
 pub struct VulkanTexture {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
+    // None means the host owns the image, allocation AND view. Yakui still
+    // owns this wrapper's sampler and descriptor slot until frame retirement.
+    owned: Option<(vk::Image, TextureMemory)>,
     pub(crate) sampler: vk::Sampler,
     pub(crate) view: vk::ImageView,
     pub(crate) id: u32,
+    pub(crate) premultiplied: bool,
+}
+
+enum TextureMemory {
+    Imported(vk::DeviceMemory),
+    Allocated(Allocation),
 }
 
 /// A container for information about a texture.
@@ -26,6 +39,7 @@ pub struct VulkanTextureCreateInfo<T> {
     min_filter: vk::Filter,
     mag_filter: vk::Filter,
     address_mode: vk::SamplerAddressMode,
+    premultiplied: bool,
 }
 
 impl<T: AsRef<[u8]>> VulkanTextureCreateInfo<T> {
@@ -46,7 +60,13 @@ impl<T: AsRef<[u8]>> VulkanTextureCreateInfo<T> {
             min_filter,
             mag_filter,
             address_mode,
+            premultiplied: false,
         }
+    }
+    /// Indicate that RGB already includes alpha. Defaults to straight alpha.
+    pub fn premultiplied(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
     }
 }
 
@@ -55,6 +75,9 @@ impl VulkanTexture {
     /// [`super::YakuiVulkan::create_user_texture()`].
     ///
     /// ## Safety
+    /// Takes ownership of the image, its memory and its view. They are destroyed
+    /// when the texture is removed and its final frame completes, or at cleanup.
+    ///
     /// - All Vulkan handles must have been created on the same `vulkan_context`
     pub fn from_image(
         vulkan_context: &VulkanContext,
@@ -62,6 +85,42 @@ impl VulkanTexture {
         image: vk::Image,
         memory: vk::DeviceMemory,
         view: vk::ImageView,
+    ) -> Self {
+        Self::from_view(
+            vulkan_context,
+            descriptors,
+            view,
+            Some((image, TextureMemory::Imported(memory))),
+        )
+    }
+
+    /// Register a host-owned sampled image view without taking its allocation.
+    /// Yakui owns the sampler and descriptor slot; removal retires those only.
+    ///
+    /// # Safety
+    /// The view must belong to this device and support sampling. The host must
+    /// keep its image, allocation and view alive until every frame using this
+    /// registration has finished, including the frame that removes it. The image
+    /// must be in SHADER_READ_ONLY_OPTIMAL when sampled by Yakui.
+    pub unsafe fn borrowed_view(
+        context: &VulkanContext,
+        descriptors: &mut Descriptors,
+        view: vk::ImageView,
+    ) -> Self {
+        Self::from_view(context, descriptors, view, None)
+    }
+
+    /// Specify the alpha convention for imported images (straight by default).
+    pub fn premultiplied(mut self, premultiplied: bool) -> Self {
+        self.premultiplied = premultiplied;
+        self
+    }
+
+    fn from_view(
+        vulkan_context: &VulkanContext,
+        descriptors: &mut Descriptors,
+        view: vk::ImageView,
+        owned: Option<(vk::Image, TextureMemory)>,
     ) -> Self {
         let address_mode = vk::SamplerAddressMode::CLAMP_TO_EDGE;
         let filter = vk::Filter::LINEAR;
@@ -82,11 +141,11 @@ impl VulkanTexture {
         let id =
             unsafe { descriptors.update_texture_descriptor_set(view, sampler, vulkan_context) };
         VulkanTexture {
-            image,
-            memory,
+            owned,
             sampler,
             view,
             id,
+            premultiplied: false,
         }
     }
 
@@ -103,9 +162,11 @@ impl VulkanTexture {
             min_filter,
             mag_filter,
             address_mode,
+            premultiplied,
         } = create_info;
 
-        let (image, memory) = unsafe { vulkan_context.create_image(resolution, format) };
+        let (image, memory) =
+            unsafe { vulkan_context.create_image(&mut queue.memory, resolution, format) };
         unsafe {
             queue.push(vulkan_context, image, resolution, image_data.as_ref());
         }
@@ -130,11 +191,11 @@ impl VulkanTexture {
             unsafe { descriptors.update_texture_descriptor_set(view, sampler, vulkan_context) };
 
         VulkanTexture {
-            image,
-            memory,
+            owned: Some((image, TextureMemory::Allocated(memory))),
             view,
             sampler,
             id,
+            premultiplied,
         }
     }
 
@@ -165,16 +226,22 @@ impl VulkanTexture {
                 min_filter,
                 mag_filter,
                 address_mode,
-            ),
+            )
+            .premultiplied(texture.format() == yakui::paint::TextureFormat::Rgba8SrgbPremultiplied),
             queue,
         )
     }
 
-    pub(crate) unsafe fn cleanup(&self, device: &ash::Device) {
+    pub(crate) unsafe fn cleanup(self, device: &ash::Device, allocator: &mut Allocator) {
         device.destroy_sampler(self.sampler, None);
-        device.destroy_image_view(self.view, None);
-        device.destroy_image(self.image, None);
-        device.free_memory(self.memory, None);
+        if let Some((image, memory)) = self.owned {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(image, None);
+            match memory {
+                TextureMemory::Imported(memory) => device.free_memory(memory, None),
+                TextureMemory::Allocated(memory) => allocator.free(device, memory),
+            }
+        }
     }
 }
 
@@ -202,8 +269,10 @@ fn get_address_mode(yakui_address_mode: yakui::paint::AddressMode) -> vk::Sample
 
 #[derive(Default)]
 pub(crate) struct UploadQueue {
-    phase: UploadPhase,
-    in_flight: VecDeque<UploadPhase>,
+    pub memory: Allocator,
+    phase: FrameResources,
+    in_flight: VecDeque<FrameResources>,
+    available: Vec<FrameResources>,
     textures: Vec<(vk::Image, vk::Extent2D, vk::Buffer, usize)>,
     pre_barriers: Vec<vk::ImageMemoryBarrier<'static>>,
     post_barriers: Vec<vk::ImageMemoryBarrier<'static>>,
@@ -214,23 +283,79 @@ impl UploadQueue {
         Self::default()
     }
 
-    /// Call when a draw command buffer has begun execution
+    /// Seal all resources recorded for this frame. Further writes use another slot.
     pub fn phase_submitted(&mut self) {
-        let phase = mem::take(&mut self.phase);
+        assert!(
+            self.textures.is_empty(),
+            "record pending texture uploads before submission"
+        );
+        let next = self.available.pop().unwrap_or_default();
+        let phase = std::mem::replace(&mut self.phase, next);
         self.in_flight.push_back(phase);
     }
 
-    /// Call whenever a draw command buffer has completed execution
-    pub unsafe fn phase_executed(&mut self, vulkan_context: &VulkanContext) {
-        let mut finished = self.in_flight.pop_front().expect("no commands in flight");
-        // TODO: Reuse
-        finished.cleanup(vulkan_context.device);
+    /// The host has waited for all transfer and drawing work in the oldest frame.
+    pub unsafe fn phase_executed(
+        &mut self,
+        context: &VulkanContext,
+        descriptors: &mut Descriptors,
+    ) {
+        let mut finished = self.in_flight.pop_front().expect("no frames in flight");
+        for texture in finished.graveyard.drain(..) {
+            let id = texture.id;
+            texture.cleanup(context.device, &mut self.memory);
+            descriptors.release_texture(id);
+        }
+        finished.geometry_used = 0;
+        finished.staging_used = 0;
+        for (_, fill) in &mut finished.buffers {
+            *fill = 0;
+        }
+        self.available.push(finished);
     }
 
-    /// Schedule `texture` to be disposed of after the previous phase completes
+    /// Retire after this frame, including any already-recorded uploads/draws.
     pub unsafe fn dispose(&mut self, texture: VulkanTexture) {
-        let phase = self.in_flight.back_mut().unwrap_or(&mut self.phase);
-        phase.graveyard.push(texture);
+        // Frames are submitted and completed in order on the host's graphics
+        // queue. Waiting for this frame also covers earlier uses of the texture.
+        self.phase.graveyard.push(texture);
+    }
+
+    pub unsafe fn geometry(
+        &mut self,
+        context: &VulkanContext,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> (vk::Buffer, vk::Buffer) {
+        let index = self.phase.geometry_used;
+        if index == self.phase.geometry.len() {
+            self.phase.geometry.push(GeometryBuffers {
+                vertices: Buffer::with_capacity(
+                    context,
+                    &mut self.memory,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    vertices.len(),
+                ),
+                indices: Buffer::with_capacity(
+                    context,
+                    &mut self.memory,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    indices.len(),
+                ),
+            });
+        }
+        let pair = &mut self.phase.geometry[index];
+        // This pair has not been used in this frame. Earlier frames cannot own
+        // it because only GPU-completed slots enter the available pool. A second
+        // paint call receives another pair so it cannot overwrite recorded data.
+        pair.vertices
+            .reserve(context, &mut self.memory, vertices.len());
+        pair.indices
+            .reserve(context, &mut self.memory, indices.len());
+        pair.vertices.write(0, vertices);
+        pair.indices.write(0, indices);
+        self.phase.geometry_used += 1;
+        (pair.vertices.handle, pair.indices.handle)
     }
 
     unsafe fn push(
@@ -244,6 +369,8 @@ impl UploadQueue {
             dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
             new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             image,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 level_count: 1,
@@ -252,7 +379,7 @@ impl UploadQueue {
             },
             ..Default::default()
         });
-        let (buffer, offset) = self.phase.push(vulkan_context, data);
+        let (buffer, offset) = self.phase.push(vulkan_context, &mut self.memory, data);
         self.textures.push((image, extent, buffer, offset));
         self.post_barriers.push(vk::ImageMemoryBarrier {
             src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
@@ -260,6 +387,8 @@ impl UploadQueue {
             old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             image,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 level_count: 1,
@@ -315,48 +444,74 @@ impl UploadQueue {
     }
 
     pub unsafe fn cleanup(&mut self, device: &ash::Device) {
-        self.phase.cleanup(device);
-        while let Some(mut phase) = self.in_flight.pop_front() {
-            phase.cleanup(device);
+        self.phase.cleanup(device, &mut self.memory);
+        for mut phase in self.in_flight.drain(..).chain(self.available.drain(..)) {
+            phase.cleanup(device, &mut self.memory);
         }
+        self.memory.cleanup(device);
     }
 }
 
 #[derive(Default)]
-struct UploadPhase {
+struct FrameResources {
     buffers: Vec<(Buffer<u8>, usize)>,
+    staging_used: usize,
+    geometry: Vec<GeometryBuffers>,
+    geometry_used: usize,
     graveyard: Vec<VulkanTexture>,
 }
 
-impl UploadPhase {
-    unsafe fn cleanup(&mut self, device: &ash::Device) {
-        for (buffer, _) in &self.buffers {
-            buffer.cleanup(device);
+struct GeometryBuffers {
+    vertices: Buffer<Vertex>,
+    indices: Buffer<u32>,
+}
+
+impl FrameResources {
+    unsafe fn cleanup(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        for (buffer, _) in self.buffers.drain(..) {
+            buffer.cleanup(device, allocator);
         }
-        for texture in &self.graveyard {
-            texture.cleanup(device);
+        for pair in self.geometry.drain(..) {
+            pair.vertices.cleanup(device, allocator);
+            pair.indices.cleanup(device, allocator);
+        }
+        for texture in self.graveyard.drain(..) {
+            texture.cleanup(device, allocator);
         }
     }
 
-    unsafe fn push(&mut self, vulkan_context: &VulkanContext, data: &[u8]) -> (vk::Buffer, usize) {
-        if self
-            .buffers
-            .last()
-            .is_none_or(|(buffer, fill)| fill + data.len() > buffer.capacity())
-        {
-            self.buffers.push((
-                Buffer::with_capacity(
-                    vulkan_context,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                    data.len().max(1024 * 1024),
-                ),
-                0,
-            ));
+    unsafe fn push(
+        &mut self,
+        context: &VulkanContext,
+        allocator: &mut Allocator,
+        data: &[u8],
+    ) -> (vk::Buffer, usize) {
+        loop {
+            let index = self.staging_used;
+            if index == self.buffers.len() {
+                self.buffers.push((
+                    Buffer::with_capacity(
+                        context,
+                        allocator,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        data.len(),
+                    ),
+                    0,
+                ));
+            }
+            let (buffer, fill) = &mut self.buffers[index];
+            // Image copy offsets must be four-byte aligned, even for odd-sized
+            // R8 images. Never relocate a chunk referenced by an earlier copy.
+            let start = (*fill + 3) & !3;
+            if *fill == 0 {
+                buffer.reserve(context, allocator, data.len());
+            }
+            if start + data.len() <= buffer.capacity() {
+                *fill = start + data.len();
+                buffer.write(start, data);
+                return (buffer.handle, start);
+            }
+            self.staging_used += 1;
         }
-        let (buffer, offset) = self.buffers.last_mut().unwrap();
-        let start = *offset;
-        *offset += data.len();
-        buffer.write(vulkan_context, start, data);
-        (buffer.handle, start)
     }
 }

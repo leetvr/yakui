@@ -9,12 +9,12 @@ use crate::event::{Event, EventInterest, EventResponse, WidgetEvent};
 use crate::id::WidgetId;
 use crate::layout::LayoutDom;
 use crate::navigation::{navigate, NavDirection};
-use crate::widget::EventContext;
+use crate::widget::{EventContext, FocusPolicy};
 
 use super::mouse::MouseButton;
 use super::{KeyCode, Modifiers};
 
-/// Holds yakui's input state, like cursor position, hovered, and selected
+/// Holds yakui's input state, like cursor position, hovered, and focused
 /// widgets.
 #[derive(Debug)]
 pub struct InputState {
@@ -27,14 +27,20 @@ pub struct InputState {
     /// Details about widgets and their mouse intersections.
     intersections: RefCell<Intersections>,
 
-    /// The widget that is currently selected.
-    selection: Cell<Option<WidgetId>>,
+    /// The widget that is currently focused.
+    focus: Cell<Option<WidgetId>>,
 
-    /// The widget that was selected last frame.
-    last_selection: Cell<Option<WidgetId>>,
+    /// Whether the latest focus change was due to navigation.
+    focus_navigation: Cell<bool>,
+
+    /// The widget that was focused last frame.
+    last_focus: Cell<Option<WidgetId>>,
 
     /// If there's a pending navigation event, it's stored here!
     pending_navigation: Cell<Option<NavDirection>>,
+
+    /// If set, navigation is enabled.
+    navigation_enabled: Cell<bool>,
 
     /// If set, text input should be active.
     text_input_enabled: Cell<bool>,
@@ -116,17 +122,19 @@ impl InputState {
                 mouse_entered_and_sunk: Vec::new(),
                 mouse_down_in: HashMap::new(),
             }),
-            selection: Cell::new(None),
-            last_selection: Cell::new(None),
+            focus: Cell::new(None),
+            focus_navigation: Cell::new(false),
+            last_focus: Cell::new(None),
             pending_navigation: Cell::new(None),
             text_input_enabled: Cell::new(false),
+            navigation_enabled: Cell::new(true),
         }
     }
 
     /// Begin a new frame for input handling.
     pub fn start(&self, dom: &Dom, layout: &LayoutDom) {
         self.text_input_enabled.set(false);
-        self.notify_selection(dom, layout);
+        self.notify_focus(dom, layout);
     }
 
     /// Finish applying input events for this frame.
@@ -138,7 +146,7 @@ impl InputState {
     fn handle_navigation(&self, dom: &Dom, layout: &LayoutDom) {
         if let Some(dir) = self.pending_navigation.take() {
             if let Some(new_focus) = navigate(dom, layout, self, dir) {
-                dom.request_focus(new_focus);
+                self.set_focus(Some(new_focus), true);
             }
         }
     }
@@ -155,14 +163,28 @@ impl InputState {
         self.text_input_enabled.get()
     }
 
-    /// Return the currently selected widget, if there is one.
-    pub fn selection(&self) -> Option<WidgetId> {
-        self.selection.get()
+    /// Returns the mouse position, or [`None`] if it's outside the window.
+    pub fn mouse_pos(&self, layout: &LayoutDom) -> Option<Vec2> {
+        self.mouse
+            .borrow()
+            .position
+            .map(|pos| pos / layout.scale_factor())
     }
 
-    /// Set the currently selected widget.
-    pub fn set_selection(&self, id: Option<WidgetId>) {
-        self.selection.set(id);
+    /// Return the currently focused widget, if there is one.
+    pub fn focus(&self) -> Option<WidgetId> {
+        self.focus.get()
+    }
+
+    /// Set the currently focused widget.
+    pub fn set_focus(&self, id: Option<WidgetId>, from_navigation: bool) {
+        self.focus.set(id);
+        self.focus_navigation.set(from_navigation);
+    }
+
+    /// Sets whether navigation is enabled.
+    pub fn set_navigation_enabled(&self, enabled: bool) {
+        self.navigation_enabled.set(enabled);
     }
 
     /// Attempt to navigate in a direction within the UI.
@@ -176,29 +198,18 @@ impl InputState {
         layout: &LayoutDom,
         event: &Event,
     ) -> EventResponse {
-        match event {
+        let res = match event {
             Event::CursorMoved(pos) => {
                 self.mouse_moved(dom, layout, *pos);
                 EventResponse::Bubble
             }
             Event::MouseButtonChanged { button, down } => {
-                let response = self.mouse_button_changed(dom, layout, *button, *down);
-
-                // If no widgets elected to handle mouse button one going down,
-                // we can should clear our selection.
-                //
-                // FIXME: Currently, this gets sunk by widgets that sink events
-                // but don't do anything to the selection state with them. We
-                // should figure out how to detect that case, like clicking an
-                // Opaque widget.
-                if response == EventResponse::Bubble {
-                    if *button == MouseButton::One && *down {
-                        self.set_selection(None);
-                        self.notify_selection(dom, layout);
-                    }
+                // Left clicking clears focus, unless the widget handling the event sets the
+                // same focus again
+                if button == &MouseButton::One && *down {
+                    self.set_focus(None, false);
                 }
-
-                response
+                self.mouse_button_changed(dom, layout, *button, *down)
             }
             Event::MouseScroll { delta } => self.send_mouse_scroll(dom, layout, *delta),
             Event::KeyChanged {
@@ -208,13 +219,23 @@ impl InputState {
             } => self.keyboard_key_changed(dom, layout, *key, *down, *modifiers),
             Event::ModifiersChanged(modifiers) => self.modifiers_changed(modifiers),
             Event::TextInput(c) => self.text_input(dom, layout, *c),
+            Event::RequestFocus(id) => {
+                self.set_focus(*id, false);
+                EventResponse::Bubble
+            }
             _ => EventResponse::Bubble,
-        }
+        };
+
+        // Any input events can change focus, notify of changes immediately
+        self.notify_focus(dom, layout);
+
+        res
     }
 
-    fn notify_selection(&self, dom: &Dom, layout: &LayoutDom) {
-        let mut current = self.selection.get();
-        let last = self.last_selection.get();
+    fn notify_focus(&self, dom: &Dom, layout: &LayoutDom) {
+        let mut current = self.focus.get();
+        let last = self.last_focus.get();
+        let navigation = self.focus_navigation.get();
 
         if current == last {
             return;
@@ -227,10 +248,13 @@ impl InputState {
                     layout,
                     entered,
                     &mut node,
-                    &WidgetEvent::FocusChanged(true),
+                    &WidgetEvent::FocusChanged {
+                        focused: true,
+                        navigation,
+                    },
                 );
             } else {
-                self.selection.set(None);
+                self.set_focus(None, false);
                 current = None;
             }
         }
@@ -242,12 +266,15 @@ impl InputState {
                     layout,
                     left,
                     &mut node,
-                    &WidgetEvent::FocusChanged(false),
+                    &WidgetEvent::FocusChanged {
+                        focused: false,
+                        navigation,
+                    },
                 );
             }
         }
 
-        self.last_selection.set(current);
+        self.last_focus.set(current);
     }
 
     /// Signal that the mouse has moved.
@@ -303,29 +330,78 @@ impl InputState {
         down: bool,
         modifiers: Option<Modifiers>,
     ) -> EventResponse {
-        let selected = self.selection.get();
-        if let Some(id) = selected {
-            let Some(layout_node) = layout.get(id) else {
-                return EventResponse::Bubble;
-            };
+        let modifiers = modifiers.unwrap_or(self.modifiers.get());
+        let res = self.send_key_to_focus(dom, layout, key, down, modifiers);
+        if res == EventResponse::Sink {
+            // don't attempt key navigation
+            return res;
+        }
+        self.key_navigate(key, down, modifiers)
+    }
 
-            if layout_node
-                .event_interest
-                .contains(EventInterest::FOCUSED_KEYBOARD)
-            {
-                // Panic safety: if this node is in the layout DOM, it must be
-                // in the DOM.
-                let mut node = dom.get_mut(id).unwrap();
-                let event = WidgetEvent::KeyChanged {
-                    key,
-                    down,
-                    modifiers: modifiers.unwrap_or(self.modifiers.get()),
-                };
-                return self.fire_event(dom, layout, id, &mut node, &event);
-            }
+    fn send_key_to_focus(
+        &self,
+        dom: &Dom,
+        layout: &LayoutDom,
+        key: KeyCode,
+        down: bool,
+        modifiers: Modifiers,
+    ) -> EventResponse {
+        let Some(id) = self.focus.get() else {
+            return EventResponse::Bubble;
+        };
+        let Some(layout_node) = layout.get(id) else {
+            return EventResponse::Bubble;
+        };
+
+        if !layout_node
+            .event_interest
+            .contains(EventInterest::FOCUSED_KEYBOARD)
+        {
+            return EventResponse::Bubble;
         }
 
-        EventResponse::Bubble
+        // Panic safety: if this node is in the layout DOM, it must be
+        // in the DOM.
+        let mut node = dom.get_mut(id).unwrap();
+        let event = WidgetEvent::KeyChanged {
+            key,
+            down,
+            modifiers,
+        };
+        self.fire_event(dom, layout, id, &mut node, &event)
+    }
+
+    fn key_navigate(&self, key: KeyCode, down: bool, modifiers: Modifiers) -> EventResponse {
+        if !self.navigation_enabled.get() {
+            return EventResponse::Bubble;
+        }
+
+        let direction = match key {
+            KeyCode::Tab if modifiers.shift() => NavDirection::Previous,
+            KeyCode::Tab => NavDirection::Next,
+            KeyCode::ArrowDown => NavDirection::Down,
+            KeyCode::ArrowUp => NavDirection::Up,
+            KeyCode::ArrowLeft => NavDirection::Left,
+            KeyCode::ArrowRight => NavDirection::Right,
+            _ => return EventResponse::Bubble,
+        };
+
+        if self.focus().is_none()
+            && matches!(
+                direction,
+                NavDirection::Down | NavDirection::Up | NavDirection::Left | NavDirection::Right
+            )
+        {
+            return EventResponse::Bubble;
+        }
+
+        if down {
+            self.navigate(direction);
+        }
+
+        // still sink the up too
+        EventResponse::Sink
     }
 
     fn modifiers_changed(&self, modifiers: &Modifiers) -> EventResponse {
@@ -334,8 +410,8 @@ impl InputState {
     }
 
     fn text_input(&self, dom: &Dom, layout: &LayoutDom, c: char) -> EventResponse {
-        let selected = self.selection.get();
-        if let Some(id) = selected {
+        let focus = self.focus.get();
+        if let Some(id) = focus {
             let Some(layout_node) = layout.get(id) else {
                 return EventResponse::Bubble;
             };
@@ -376,6 +452,17 @@ impl InputState {
                     modifiers: self.modifiers.get(),
                 };
                 let response = self.fire_event(dom, layout, id, &mut node, &event);
+                drop(node);
+
+                if button == MouseButton::One
+                    && down
+                    && response == EventResponse::Sink
+                    && self.focus().is_none()
+                {
+                    if let Some(target) = pointer_focus_target(dom, id) {
+                        self.set_focus(Some(target), false);
+                    }
+                }
 
                 if response == EventResponse::Sink {
                     overall_response = response;
@@ -555,5 +642,15 @@ fn hit_test(_dom: &Dom, layout: &LayoutDom, coords: Vec2, output: &mut Vec<Widge
         if rect.contains_point(coords) {
             output.push(id);
         }
+    }
+}
+
+fn pointer_focus_target(dom: &Dom, mut current: WidgetId) -> Option<WidgetId> {
+    loop {
+        let node = dom.get(current)?;
+        if node.widget.focus_policy().contains(FocusPolicy::POINTER) {
+            return Some(current);
+        }
+        current = node.parent?;
     }
 }

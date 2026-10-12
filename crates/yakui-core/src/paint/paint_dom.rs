@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-use glam::Vec2;
+use glam::{Mat2, Vec2};
+use parking_lot::RwLock;
 use thunderdome::Arena;
 
 use crate::dom::Dom;
@@ -25,11 +28,36 @@ pub struct PaintLimits {
     pub max_texture_size_3d: u32,
 }
 
+/// A paint transform in logical coordinates. Layout and hit testing remain
+/// unchanged. Scale and rotation occur about `origin`, followed by translation.
+/// Scissor clips enclose transformed rectangles with axis-aligned bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaintTransform {
+    /// Scale on each axis. The default is one.
+    pub scale: Vec2,
+    /// Rotation in radians. Positive angles turn clockwise on the UI surface.
+    pub rotation: f32,
+    /// Translation after scaling, in logical units.
+    pub translation: Vec2,
+    /// Fixed point about which scaling occurs.
+    pub origin: Vec2,
+}
+
+impl Default for PaintTransform {
+    fn default() -> Self {
+        Self {
+            scale: Vec2::ONE,
+            rotation: 0.,
+            translation: Vec2::ZERO,
+            origin: Vec2::ZERO,
+        }
+    }
+}
+
 /// Contains all information about how to paint the current set of widgets.
 #[derive(Debug)]
 pub struct PaintDom {
-    textures: Arena<Texture>,
-    texture_edits: HashMap<ManagedTextureId, TextureChange>,
+    textures: Arc<RwLock<Textures>>,
     surface_size: Vec2,
     unscaled_viewport: Rect,
     scale_factor: f32,
@@ -37,14 +65,72 @@ pub struct PaintDom {
 
     layers: PaintLayers,
     clip_stack: Vec<Rect>,
+    paint_linear: Mat2,
+    paint_translation: Vec2,
+    opacity: f32,
+}
+
+/// Stores textures for one or more `PaintDom` instances.
+#[derive(Debug, Default)]
+pub struct Textures {
+    storage: Arena<Texture>,
+    texture_edits: HashMap<ManagedTextureId, TextureChange>,
+}
+
+impl Textures {
+    /// Add a texture to the Paint DOM, returning an ID that can be used to
+    /// reference it later.
+    pub fn add(&mut self, texture: Texture) -> ManagedTextureId {
+        let texture = self.storage.insert(texture);
+
+        let id = ManagedTextureId::new(texture);
+        self.texture_edits.insert(id, TextureChange::Added);
+        id
+    }
+
+    /// Remove a texture from the Paint DOM.
+    pub fn remove(&mut self, id: ManagedTextureId) {
+        self.storage.remove(id.index());
+        self.texture_edits.insert(id, TextureChange::Removed);
+    }
+
+    /// Retrieve a texture by its ID, if it exists.
+    pub fn get(&self, id: ManagedTextureId) -> Option<&Texture> {
+        self.storage.get(id.index())
+    }
+
+    /// Retrieves a mutable reference to a texture by its ID.
+    pub fn get_mut(&mut self, id: ManagedTextureId) -> Option<&mut Texture> {
+        self.storage.get_mut(id.index())
+    }
+
+    /// Mark a texture as modified so that changes can be detected.
+    pub fn mark_modified(&mut self, id: ManagedTextureId) {
+        self.texture_edits.insert(id, TextureChange::Modified);
+    }
+
+    /// Returns an iterator over all textures known to the Paint DOM.
+    pub fn iter(&self) -> impl Iterator<Item = (ManagedTextureId, &Texture)> {
+        self.storage
+            .iter()
+            .map(|(index, texture)| (ManagedTextureId::new(index), texture))
+    }
+
+    /// Iterates over the list of changes that happened to yakui-managed
+    /// textures this frame.
+    ///
+    /// This is useful for renderers that need to upload or remove GPU resources
+    /// related to textures.
+    pub fn edits(&self) -> impl Iterator<Item = (ManagedTextureId, TextureChange)> + '_ {
+        self.texture_edits.iter().map(|(&id, &edit)| (id, edit))
+    }
 }
 
 impl PaintDom {
     /// Create a new, empty Paint DOM.
     pub fn new() -> Self {
         Self {
-            textures: Arena::new(),
-            texture_edits: HashMap::new(),
+            textures: Default::default(),
             surface_size: Vec2::ONE,
             unscaled_viewport: Rect::ONE,
             scale_factor: 1.0,
@@ -52,6 +138,17 @@ impl PaintDom {
 
             layers: PaintLayers::new(),
             clip_stack: Vec::new(),
+            paint_linear: Mat2::IDENTITY,
+            paint_translation: Vec2::ZERO,
+            opacity: 1.0,
+        }
+    }
+
+    /// Create a new `PaintDom` that shares resources with this existing one.
+    pub fn fork(&self) -> Self {
+        Self {
+            textures: self.textures.clone(),
+            ..Self::new()
         }
     }
 
@@ -67,8 +164,11 @@ impl PaintDom {
 
     /// Prepares the PaintDom to be updated for the frame.
     pub fn start(&mut self) {
-        self.texture_edits.clear();
+        self.textures_mut().texture_edits.clear();
         self.clip_stack.clear();
+        self.paint_linear = Mat2::IDENTITY;
+        self.paint_translation = Vec2::ZERO;
+        self.opacity = 1.0;
     }
 
     /// Returns the size of the surface that is being painted onto.
@@ -87,6 +187,34 @@ impl PaintDom {
 
     pub(crate) fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
+    }
+
+    /// Apply a transform to all geometry and descendant clips painted by `paint`.
+    /// Nested transforms compose in parent/child order. This does not affect
+    /// layout, focus or pointer bounds; animate those through widget layout.
+    pub fn with_transform<R>(
+        &mut self,
+        transform: PaintTransform,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = (self.paint_linear, self.paint_translation);
+        let local = Mat2::from_angle(transform.rotation) * Mat2::from_diagonal(transform.scale);
+        let offset = transform.origin - local * transform.origin + transform.translation;
+        self.paint_translation += self.paint_linear * offset;
+        self.paint_linear *= local;
+        let result = paint(self);
+        (self.paint_linear, self.paint_translation) = previous;
+        result
+    }
+
+    /// Multiply independent vertex opacity for the duration of `paint`.
+    /// Nested scopes multiply. Zero opacity preserves text color-glyph semantics.
+    pub fn with_opacity<R>(&mut self, opacity: f32, paint: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.opacity;
+        self.opacity *= opacity.clamp(0.0, 1.0);
+        let result = paint(self);
+        self.opacity = previous;
+        result
     }
 
     /// Paint a specific widget. This function is usually called as part of an
@@ -136,46 +264,27 @@ impl PaintDom {
     /// Add a texture to the Paint DOM, returning an ID that can be used to
     /// reference it later.
     pub fn add_texture(&mut self, texture: Texture) -> ManagedTextureId {
-        let id = ManagedTextureId::new(self.textures.insert(texture));
-        self.texture_edits.insert(id, TextureChange::Added);
-        id
+        self.textures.write().add(texture)
     }
 
     /// Remove a texture from the Paint DOM.
     pub fn remove_texture(&mut self, id: ManagedTextureId) {
-        self.textures.remove(id.index());
-        self.texture_edits.insert(id, TextureChange::Removed);
-    }
-
-    /// Retrieve a texture by its ID, if it exists.
-    pub fn texture(&self, id: ManagedTextureId) -> Option<&Texture> {
-        self.textures.get(id.index())
-    }
-
-    /// Retrieves a mutable reference to a texture by its ID.
-    pub fn texture_mut(&mut self, id: ManagedTextureId) -> Option<&mut Texture> {
-        self.textures.get_mut(id.index())
+        self.textures.write().remove(id)
     }
 
     /// Mark a texture as modified so that changes can be detected.
     pub fn mark_texture_modified(&mut self, id: ManagedTextureId) {
-        self.texture_edits.insert(id, TextureChange::Modified);
+        self.textures.write().mark_modified(id);
     }
 
-    /// Returns an iterator over all textures known to the Paint DOM.
-    pub fn textures(&self) -> impl Iterator<Item = (ManagedTextureId, &Texture)> {
-        self.textures
-            .iter()
-            .map(|(index, texture)| (ManagedTextureId::new(index), texture))
+    /// Returns access to the PaintDom's texture storage.
+    pub fn textures(&self) -> impl Deref<Target = Textures> + '_ {
+        self.textures.read()
     }
 
-    /// Iterates over the list of changes that happened to yakui-managed
-    /// textures this frame.
-    ///
-    /// This is useful for renderers that need to upload or remove GPU resources
-    /// related to textures.
-    pub fn texture_edits(&self) -> impl Iterator<Item = (ManagedTextureId, TextureChange)> + '_ {
-        self.texture_edits.iter().map(|(&id, &edit)| (id, edit))
+    /// Returns mutable access to the PaintDom's texture storage.
+    pub fn textures_mut(&self) -> impl DerefMut<Target = Textures> + '_ {
+        self.textures.write()
     }
 
     /// Returns a list of layers that should be used to draw the UI.
@@ -225,7 +334,8 @@ impl PaintDom {
         call.indices.extend(indices);
 
         let vertices = mesh.vertices.into_iter().map(|mut vertex| {
-            let mut pos = vertex.position * self.scale_factor;
+            let logical = self.paint_linear * vertex.position + self.paint_translation;
+            let mut pos = logical * self.scale_factor;
             pos += self.unscaled_viewport.pos();
 
             // Currently, we only round the vertices of geometry fed to the text
@@ -233,13 +343,20 @@ impl PaintDom {
             // some geometry, like rounded rectangles.
             //
             // See: https://github.com/SecondHalfGames/yakui/issues/153
-            if mesh.pipeline == Pipeline::Text {
+            // Static opaque text keeps pixel snapping; text in motion moves smoothly
+            // rather than jumping between whole pixels during an animation.
+            if mesh.pipeline == Pipeline::Text
+                && self.paint_linear == Mat2::IDENTITY
+                && self.paint_translation == Vec2::ZERO
+                && self.opacity == 1.0
+            {
                 pos = pos.round();
             }
 
             pos /= self.surface_size;
 
             vertex.position = pos;
+            vertex.opacity *= self.opacity;
             vertex
         });
         call.vertices.extend(vertices);
@@ -247,9 +364,22 @@ impl PaintDom {
 
     /// Use the given region as the clipping rect for all following paint calls.
     fn push_clip(&mut self, region: Rect) {
+        let corners = [
+            region.pos(),
+            region.pos() + Vec2::new(region.size().x, 0.),
+            region.pos() + Vec2::new(0., region.size().y),
+            region.max(),
+        ];
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
+        for corner in corners {
+            let transformed = self.paint_linear * corner + self.paint_translation;
+            min = min.min(transformed);
+            max = max.max(transformed);
+        }
         let mut unscaled = Rect::from_pos_size(
-            region.pos() * self.scale_factor,
-            region.size() * self.scale_factor,
+            min * self.scale_factor + self.unscaled_viewport.pos(),
+            (max - min) * self.scale_factor,
         );
 
         if let Some(previous) = self.clip_stack.last() {

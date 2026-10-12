@@ -2,12 +2,14 @@ struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) texcoord: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) opacity: f32,
 };
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) texcoord: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) opacity: f32,
 };
 
 @group(0) @binding(0) var color_texture: texture_2d<f32>;
@@ -29,6 +31,7 @@ fn vs_main(
     out.position = vec4<f32>(adjusted, 0.0, 1.0);
     out.texcoord = in.texcoord;
     out.color = in.color;
+    out.opacity = in.opacity;
     return out;
 }
 
@@ -37,5 +40,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = textureSample(color_texture, color_sampler, in.texcoord);
     color *= in.color.a;
 
-    return in.color * color;
+    return vec4(in.color.rgb * color.rgb, color.a) * in.opacity;
 }

@@ -1,4 +1,5 @@
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
+use wgpu::CurrentSurfaceTexture;
 
 use yakui::UVec2;
 
@@ -17,6 +18,7 @@ pub struct Graphics {
     multisampling: Multisampling,
 
     pub renderer: yakui_wgpu::YakuiWgpu,
+    wgpu_buffers: yakui_wgpu::Buffers,
 }
 
 impl Graphics {
@@ -35,7 +37,7 @@ impl Graphics {
         let instance = wgpu::Instance::default();
         let surface = unsafe {
             instance.create_surface_unsafe(
-                wgpu::SurfaceTargetUnsafe::from_window(window)
+                wgpu::SurfaceTargetUnsafe::from_display_and_window(&window, &window)
                     .expect("Could not create wgpu surface from window"),
             )
         }
@@ -46,6 +48,7 @@ impl Graphics {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .unwrap();
@@ -75,12 +78,14 @@ impl Graphics {
             height: size.y,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
 
         // yakui_wgpu takes paint output from yakui and renders it for us using
         // wgpu.
-        let renderer = yakui_wgpu::YakuiWgpu::new(&device, &queue);
+        let renderer = yakui_wgpu::YakuiWgpu::new(device.clone(), queue.clone());
+        let wgpu_buffers = renderer.buffers();
 
         Self {
             device,
@@ -94,6 +99,7 @@ impl Graphics {
             multisampling: Multisampling::new(),
 
             renderer,
+            wgpu_buffers,
         }
     }
 
@@ -109,8 +115,10 @@ impl Graphics {
     #[profiling::function]
     pub fn paint(&mut self, yak: &mut yakui::Yakui, bg: wgpu::Color) {
         let output = match self.surface.get_current_texture() {
-            Ok(output) => output,
-            Err(_) => return,
+            CurrentSurfaceTexture::Success(output) | CurrentSurfaceTexture::Suboptimal(output) => {
+                output
+            }
+            _ => return,
         };
 
         let view = output
@@ -149,9 +157,9 @@ impl Graphics {
 
         let clear = encoder.finish();
 
-        let paint_yak = self.renderer.paint(yak, &self.device, &self.queue, surface);
+        let paint_yak = self.renderer.paint(yak, &mut self.wgpu_buffers, surface);
 
         self.queue.submit([clear, paint_yak]);
-        output.present();
+        self.queue.present(output);
     }
 }

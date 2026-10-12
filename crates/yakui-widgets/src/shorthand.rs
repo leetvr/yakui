@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 
 use yakui_core::geometry::{Color, Constraints, Dim2, Vec2};
+use yakui_core::navigation::NavDirections;
 use yakui_core::widget::PaintContext;
 use yakui_core::{Alignment, ManagedTextureId, Pivot, Response, TextureId};
 
@@ -16,7 +17,7 @@ use crate::widgets::{
     Flexible, FlexibleResponse, Image, ImageResponse, List, ListResponse, MaxWidth,
     MaxWidthResponse, NineSlice, Offset, OffsetResponse, Opaque, OpaqueResponse, Pad, PadResponse,
     Reflow, ReflowResponse, Scrollable, ScrollableResponse, Slider, SliderResponse, Spacer, Stack,
-    StackResponse, State, StateResponse, Text, TextBox, TextBoxResponse, TextResponse,
+    StackResponse, State, StateResponse, Text, TextBox, TextBoxResponse, TextResponse, Trap,
 };
 
 /// See [List].
@@ -64,10 +65,7 @@ pub fn button<S: Into<Cow<'static, str>>>(text: S) -> Response<ButtonResponse> {
 /// See [Circle].
 #[track_caller]
 pub fn colored_circle<S: Into<f32>>(color: Color, size: S) -> Response<CircleResponse> {
-    let mut circle = Circle::new();
-    circle.min_radius = size.into();
-    circle.color = color;
-    circle.show()
+    Circle::new().min_radius(size).color(color).show()
 }
 
 /// See [ColoredBox].
@@ -226,6 +224,12 @@ pub fn max_width(max_width: f32, children: impl FnOnce()) -> Response<MaxWidthRe
 #[track_caller]
 pub fn stack(children: impl FnOnce()) -> Response<StackResponse> {
     Stack::new().show(children)
+}
+
+/// See [Trap].
+#[track_caller]
+pub fn trap(children: impl FnOnce()) -> Response<()> {
+    Trap::new(NavDirections::ALL).show(children)
 }
 
 #[track_caller]
