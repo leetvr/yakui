@@ -48,11 +48,7 @@ fn main() {
             vulkan_test.device_memory_properties,
             vulkan_test.device_properties,
         );
-        let options = yakui_vulkan::Options {
-            render_pass: vulkan_test.render_pass,
-            ..Default::default()
-        };
-        let mut yakui_vulkan = YakuiVulkan::new(&vulkan_context, options);
+        let mut yakui_vulkan = YakuiVulkan::new(&vulkan_context);
         yakui_vulkan.set_paint_limits(&vulkan_context, &mut yak);
         let gui_state = GuiState {
             monkey: yak.add_texture(create_yakui_texture(
@@ -122,6 +118,8 @@ fn main() {
                     &vulkan_context,
                     vulkan_test.draw_command_buffer,
                     vulkan_test.swapchain_info.surface_resolution,
+                    vulkan_test.swapchain_info.surface_format.format,
+                    vulkan_test.sample_count,
                 );
             }
             vulkan_test.render_end(index);
@@ -254,8 +252,9 @@ struct VulkanTest {
     swapchain: vk::SwapchainKHR,
     present_image_views: Vec<vk::ImageView>,
 
-    render_pass: vk::RenderPass,
-    framebuffers: Vec<vk::Framebuffer>,
+    present_images: Vec<vk::Image>,
+    sample_count: vk::SampleCountFlags,
+    msaa: Option<MsaaTarget>,
 
     command_pool: vk::CommandPool,
     draw_command_buffer: vk::CommandBuffer,
@@ -372,10 +371,13 @@ impl VulkanTest {
                 .descriptor_binding_partially_bound(true)
                 .descriptor_binding_sampled_image_update_after_bind(true);
 
+        let mut rendering =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
-            .push_next(&mut descriptor_indexing_features);
+            .push_next(&mut descriptor_indexing_features)
+            .push_next(&mut rendering);
 
         let device = unsafe {
             instance
@@ -430,49 +432,36 @@ impl VulkanTest {
             desired_image_count,
         );
 
-        let (swapchain, present_image_views) = create_swapchain(&device, None, &swapchain_info);
+        let (swapchain, present_images, present_image_views) =
+            create_swapchain(&device, None, &swapchain_info);
 
-        let renderpass_attachments = [vk::AttachmentDescription {
-            format: swapchain_info.surface_format.format,
-            samples: vk::SampleCountFlags::TYPE_1,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            store_op: vk::AttachmentStoreOp::STORE,
-            final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-            ..Default::default()
-        }];
-        let color_attachment_refs = [vk::AttachmentReference {
-            attachment: 0,
-            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        }];
-        let dependencies = [vk::SubpassDependency {
-            src_subpass: vk::SUBPASS_EXTERNAL,
-            src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
-                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            ..Default::default()
-        }];
-
-        let subpass = vk::SubpassDescription::default()
-            .color_attachments(&color_attachment_refs)
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS);
-
-        let renderpass_create_info = vk::RenderPassCreateInfo::default()
-            .attachments(&renderpass_attachments)
-            .subpasses(std::slice::from_ref(&subpass))
-            .dependencies(&dependencies);
-
-        let render_pass = unsafe {
-            device
-                .create_render_pass(&renderpass_create_info, None)
+        let device_memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
+        let image_properties = unsafe {
+            instance
+                .get_physical_device_image_format_properties(
+                    physical_device,
+                    surface_format.format,
+                    vk::ImageType::TYPE_2D,
+                    vk::ImageTiling::OPTIMAL,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    vk::ImageCreateFlags::empty(),
+                )
                 .unwrap()
         };
-
-        let framebuffers = create_framebuffers(
-            &present_image_views,
-            surface_resolution,
-            render_pass,
+        let supported_samples = image_properties.sample_counts
+            & device_properties.limits.framebuffer_color_sample_counts;
+        let sample_count = [vk::SampleCountFlags::TYPE_4, vk::SampleCountFlags::TYPE_2]
+            .into_iter()
+            .find(|samples| supported_samples.contains(*samples))
+            .unwrap_or(vk::SampleCountFlags::TYPE_1);
+        let msaa = MsaaTarget::new(
             &device,
+            &device_memory_properties,
+            surface_resolution,
+            surface_format.format,
+            sample_count,
         );
 
         let pool_create_info = vk::CommandPoolCreateInfo::default()
@@ -520,11 +509,6 @@ impl VulkanTest {
                 .unwrap()
         };
 
-        let device_memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
-
         Self {
             device,
             physical_device,
@@ -538,8 +522,9 @@ impl VulkanTest {
             surface,
             swapchain,
             present_image_views,
-            render_pass,
-            framebuffers,
+            present_images,
+            sample_count,
+            msaa,
             command_pool: pool,
             draw_command_buffer,
             present_complete_semaphore,
@@ -564,26 +549,27 @@ impl VulkanTest {
                 _ => surface_capabilities.current_extent,
             };
             self.swapchain_info.surface_resolution = surface_resolution;
-            let (new_swapchain, new_present_image_views) =
+            let (new_swapchain, new_present_images, new_present_image_views) =
                 create_swapchain(&self.device, Some(self.swapchain), &self.swapchain_info);
-            let framebuffers = create_framebuffers(
-                &new_present_image_views,
-                self.swapchain_info.surface_resolution,
-                self.render_pass,
+            let msaa = MsaaTarget::new(
                 &self.device,
+                &self.device_memory_properties,
+                surface_resolution,
+                self.swapchain_info.surface_format.format,
+                self.sample_count,
             );
-
             self.destroy_swapchain(self.swapchain);
             self.present_image_views = new_present_image_views;
             self.swapchain = new_swapchain;
-            self.framebuffers = framebuffers;
+            self.present_images = new_present_images;
+            self.msaa = msaa;
         }
     }
 
     unsafe fn destroy_swapchain(&self, swapchain: vk::SwapchainKHR) {
         let device = &self.device;
-        for &fb in &self.framebuffers {
-            device.destroy_framebuffer(fb, None);
+        if let Some(msaa) = &self.msaa {
+            msaa.destroy(device);
         }
         for image_view in &self.present_image_views {
             device.destroy_image_view(*image_view, None);
@@ -638,19 +624,9 @@ impl VulkanTest {
     pub fn render_begin(&self, present_index: u32) -> u32 {
         let device = &self.device;
         unsafe {
-            let clear_values = [
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
-                },
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-            ];
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0; 4] },
+            }];
             let viewports = [vk::Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -660,16 +636,60 @@ impl VulkanTest {
                 max_depth: 1.0,
             }];
 
-            let render_pass_begin_info = vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(self.framebuffers[present_index as usize])
-                .render_area(self.swapchain_info.surface_resolution.into())
-                .clear_values(&clear_values);
-
-            device.cmd_begin_render_pass(
+            let image = self.present_images[present_index as usize];
+            let view = self.present_image_views[present_index as usize];
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let mut barriers = vec![vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(range)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+            let mut attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear_values[0]);
+            if let Some(msaa) = &self.msaa {
+                barriers.push(
+                    vk::ImageMemoryBarrier::default()
+                        .image(msaa.image)
+                        .subresource_range(range)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                );
+                attachment = attachment
+                    .image_view(msaa.view)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                    .resolve_image_view(view)
+                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            }
+            device.cmd_pipeline_barrier(
                 self.draw_command_buffer,
-                &render_pass_begin_info,
-                vk::SubpassContents::INLINE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+            device.cmd_begin_rendering(
+                self.draw_command_buffer,
+                &vk::RenderingInfo::default()
+                    .render_area(self.swapchain_info.surface_resolution.into())
+                    .layer_count(1)
+                    .color_attachments(std::slice::from_ref(&attachment)),
             );
             device.cmd_set_viewport(self.draw_command_buffer, 0, &viewports);
             device.cmd_set_scissor(
@@ -684,7 +704,28 @@ impl VulkanTest {
     pub fn render_end(&self, present_index: u32) {
         let device = &self.device;
         unsafe {
-            device.cmd_end_render_pass(self.draw_command_buffer);
+            device.cmd_end_rendering(self.draw_command_buffer);
+            device.cmd_pipeline_barrier(
+                self.draw_command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(self.present_images[present_index as usize])
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)],
+            );
             device.end_command_buffer(self.draw_command_buffer).unwrap();
             let swapchains = [self.swapchain];
             let image_indices = [present_index];
@@ -745,7 +786,7 @@ fn create_swapchain(
     device: &ash::Device,
     previous_swapchain: Option<vk::SwapchainKHR>,
     swapchain_info: &SwapchainInfo,
-) -> (vk::SwapchainKHR, Vec<vk::ImageView>) {
+) -> (vk::SwapchainKHR, Vec<vk::Image>, Vec<vk::ImageView>) {
     let SwapchainInfo {
         swapchain_loader,
         surface_format,
@@ -804,7 +845,7 @@ fn create_swapchain(
         })
         .collect();
 
-    (swapchain, present_image_views)
+    (swapchain, present_images, present_image_views)
 }
 
 impl Drop for VulkanTest {
@@ -821,7 +862,6 @@ impl Drop for VulkanTest {
                 .destroy_fence(self.setup_commands_reuse_fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.destroy_swapchain(self.swapchain);
-            self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
@@ -858,29 +898,83 @@ impl SwapchainInfo {
     }
 }
 
-fn create_framebuffers(
-    views: &[vk::ImageView],
-    extent: vk::Extent2D,
-    render_pass: vk::RenderPass,
-    device: &ash::Device,
-) -> Vec<vk::Framebuffer> {
-    let framebuffers: Vec<vk::Framebuffer> = views
-        .iter()
-        .map(|&present_image_view| {
-            let framebuffer_attachments = [present_image_view];
-            let frame_buffer_create_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&framebuffer_attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
+// One frame in flight lets every swapchain image share this multisampled target.
+struct MsaaTarget {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
 
-            unsafe {
-                device
-                    .create_framebuffer(&frame_buffer_create_info, None)
-                    .unwrap()
-            }
-        })
-        .collect();
-    framebuffers
+impl MsaaTarget {
+    fn new(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
+    ) -> Option<Self> {
+        if samples == vk::SampleCountFlags::TYPE_1 {
+            return None;
+        }
+        unsafe {
+            let image = device
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(extent.into())
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(samples)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT),
+                    None,
+                )
+                .unwrap();
+            let requirements = device.get_image_memory_requirements(image);
+            let memory_type = (0..memory_properties.memory_type_count)
+                .find(|&index| {
+                    requirements.memory_type_bits & (1 << index) != 0
+                        && memory_properties.memory_types[index as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+                .expect("MSAA image memory type");
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(memory_type),
+                    None,
+                )
+                .unwrap();
+            device.bind_image_memory(image, memory, 0).unwrap();
+            let view = device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                    None,
+                )
+                .unwrap();
+            Some(Self {
+                image,
+                memory,
+                view,
+            })
+        }
+    }
+
+    unsafe fn destroy(&self, device: &ash::Device) {
+        device.destroy_image_view(self.view, None);
+        device.destroy_image(self.image, None);
+        device.free_memory(self.memory, None);
+    }
 }

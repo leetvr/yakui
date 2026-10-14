@@ -33,8 +33,7 @@ use yakui_core::{paint::Vertex as YakuiVertex, ManagedTextureId};
 pub struct YakuiVulkan {
     /// The pipeline layout used to draw
     pipeline_layout: vk::PipelineLayout,
-    /// The graphics pipeline used to draw
-    graphics_pipeline: vk::Pipeline,
+    pipelines: HashMap<(vk::Format, vk::SampleCountFlags), vk::Pipeline>,
     /// Have we synced the first textures from yakui?
     initial_textures_synced: bool,
     /// Textures owned by yakui
@@ -49,17 +48,6 @@ pub struct YakuiVulkan {
     scratch_vertices: Vec<Vertex>,
     scratch_indices: Vec<u32>,
     scratch_draw_calls: Vec<DrawCall>,
-}
-
-/// Vulkan configuration
-#[derive(Default)]
-pub struct Options {
-    /// Indicates that VK_KHR_dynamic_rendering is enabled and should be used with the given format
-    pub dynamic_rendering_format: Option<vk::Format>,
-    /// Render pass that the GUI will be drawn in. Ignored if `dynamic_rendering_format` is set.
-    pub render_pass: vk::RenderPass,
-    /// Subpass that the GUI will be drawn in. Ignored if `dynamic_rendering_format` is set.
-    pub subpass: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,14 +117,58 @@ impl From<&YakuiVertex> for Vertex {
 }
 
 impl YakuiVulkan {
-    /// Create a new [`YakuiVulkan`] instance
+    /// Create shared renderer resources. Graphics pipelines are created on first paint
+    /// for each destination format and sample count.
     ///
-    /// ## Safety
-    /// - `vulkan_context` must have valid members
-    /// - the members of `render_surface` must have been created with the same [`ash::Device`] as `vulkan_context`.
-    pub fn new(vulkan_context: &VulkanContext, options: Options) -> Self {
+    /// `vulkan_context` must have valid members and dynamic rendering must be enabled.
+    pub fn new(vulkan_context: &VulkanContext) -> Self {
         let device = vulkan_context.device;
         let descriptors = Descriptors::new(vulkan_context);
+        let pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .push_constant_ranges(std::slice::from_ref(
+                            &vk::PushConstantRange::default()
+                                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                                .size(std::mem::size_of::<PushConstant>() as _),
+                        ))
+                        .set_layouts(std::slice::from_ref(&descriptors.layout)),
+                    None,
+                )
+                .unwrap()
+        };
+
+        Self {
+            descriptors,
+            pipeline_layout,
+            pipelines: HashMap::new(),
+            user_textures: Default::default(),
+            yakui_managed_textures: Default::default(),
+            initial_textures_synced: false,
+            uploads: UploadQueue::new(),
+            scratch_vertices: Vec::new(),
+            scratch_indices: Vec::new(),
+            scratch_draw_calls: Vec::new(),
+        }
+    }
+
+    fn create_pipeline(
+        vulkan_context: &VulkanContext,
+        pipeline_layout: vk::PipelineLayout,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
+    ) -> vk::Pipeline {
+        assert!(
+            samples.as_raw().is_power_of_two()
+                && vulkan_context
+                    .properties
+                    .limits
+                    .framebuffer_color_sample_counts
+                    .contains(samples),
+            "sample_count must be a single supported color attachment sample count"
+        );
+        let device = vulkan_context.device;
 
         let mut vertex_spv_file = Cursor::new(&include_bytes!("../shaders/main.vert.spv")[..]);
         let mut frag_spv_file = Cursor::new(&include_bytes!("../shaders/main.frag.spv")[..]);
@@ -159,21 +191,6 @@ impl YakuiVulkan {
             device
                 .create_shader_module(&frag_shader_info, None)
                 .expect("Fragment shader module error")
-        };
-
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .push_constant_ranges(std::slice::from_ref(
-                            &vk::PushConstantRange::default()
-                                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                                .size(std::mem::size_of::<PushConstant>() as _),
-                        ))
-                        .set_layouts(std::slice::from_ref(&descriptors.layout)),
-                    None,
-                )
-                .unwrap()
         };
 
         let shader_entry_name = c"main";
@@ -246,7 +263,7 @@ impl YakuiVulkan {
             ..Default::default()
         };
         let multisample_state_info = vk::PipelineMultisampleStateCreateInfo {
-            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            rasterization_samples: samples,
             ..Default::default()
         };
         let noop_stencil_state = vk::StencilOpState {
@@ -283,7 +300,10 @@ impl YakuiVulkan {
         let dynamic_state_info =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state);
 
-        let mut graphic_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        let formats = [format];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+        let graphic_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stage_create_infos)
             .vertex_input_state(&vertex_input_state_info)
             .input_assembly_state(&vertex_input_assembly_state_info)
@@ -293,24 +313,8 @@ impl YakuiVulkan {
             .depth_stencil_state(&depth_state_info)
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state_info)
-            .layout(pipeline_layout);
-        let rendering_info_formats;
-        let mut rendering_info;
-        assert!(
-            options.dynamic_rendering_format.is_some()
-                || options.render_pass != vk::RenderPass::null(),
-            "either dynamic_rendering_format or render_pass must be set"
-        );
-        if let Some(format) = options.dynamic_rendering_format {
-            rendering_info_formats = [format];
-            rendering_info = vk::PipelineRenderingCreateInfo::default()
-                .color_attachment_formats(&rendering_info_formats);
-            graphic_pipeline_info = graphic_pipeline_info.push_next(&mut rendering_info);
-        } else {
-            graphic_pipeline_info = graphic_pipeline_info
-                .render_pass(options.render_pass)
-                .subpass(options.subpass);
-        }
+            .layout(pipeline_layout)
+            .push_next(&mut rendering_info);
 
         let graphics_pipelines = unsafe {
             device
@@ -329,18 +333,7 @@ impl YakuiVulkan {
             device.destroy_shader_module(fragment_shader_module, None);
         }
 
-        Self {
-            descriptors,
-            pipeline_layout,
-            graphics_pipeline,
-            user_textures: Default::default(),
-            yakui_managed_textures: Default::default(),
-            initial_textures_synced: false,
-            uploads: UploadQueue::new(),
-            scratch_vertices: Vec::new(),
-            scratch_indices: Vec::new(),
-            scratch_draw_calls: Vec::new(),
-        }
+        graphics_pipeline
     }
 
     /// Record transfer commands that must complete before painting this `paint`
@@ -391,17 +384,25 @@ impl YakuiVulkan {
         });
     }
 
-    /// Paint the yakui GUI using the provided [`VulkanContext`]
+    /// Paint the GUI into the current dynamic-rendering destination.
+    /// Pipelines are cached by `format` and `samples`; no destination state is retained.
+    ///
+    /// Panics if `samples` is not a single supported color attachment sample count
+    /// or pipeline creation fails.
     ///
     /// ## Safety
     /// - `vulkan_context` must be the same as the one used to create this [`YakuiVulkan`] instance
-    /// - `cmd` must be in rendering state, with viewport and scissor dynamic states set.
+    /// - `cmd` must be inside dynamic rendering with viewport and scissor set.
+    /// - `format` and `samples` must match the bound color attachment; its extent must
+    ///   cover `resolution`. The caller owns attachments, synchronization and resolves.
     pub unsafe fn paint(
         &mut self,
         paint: &yakui_core::paint::PaintDom,
         vulkan_context: &VulkanContext,
         cmd: vk::CommandBuffer,
         resolution: vk::Extent2D,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
     ) {
         // If there's nothing to paint, well.. don't paint!
         let layers = paint.layers();
@@ -409,6 +410,9 @@ impl YakuiVulkan {
             return;
         }
 
+        let pipeline = *self.pipelines.entry((format, samples)).or_insert_with(|| {
+            Self::create_pipeline(vulkan_context, self.pipeline_layout, format, samples)
+        });
         self.build_draw_calls(paint);
         let buffers = self.uploads.geometry(
             vulkan_context,
@@ -421,6 +425,7 @@ impl YakuiVulkan {
             cmd,
             &self.scratch_draw_calls,
             buffers,
+            pipeline,
         );
     }
 
@@ -432,17 +437,14 @@ impl YakuiVulkan {
         command_buffer: vk::CommandBuffer,
         draw_calls: &[DrawCall],
         buffers: (vk::Buffer, vk::Buffer),
+        pipeline: vk::Pipeline,
     ) {
         let device = vulkan_context.device;
 
         let surface_size = UVec2::new(resolution.width, resolution.height);
 
         unsafe {
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline,
-            );
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             let default_scissor = [resolution.into()];
             // A preceding paint in this render pass may have left a clip active.
             device.cmd_set_scissor(command_buffer, 0, &default_scissor);
@@ -601,7 +603,9 @@ impl YakuiVulkan {
         for (_, texture) in self.user_textures.drain() {
             texture.cleanup(device, &mut self.uploads.memory);
         }
-        device.destroy_pipeline(self.graphics_pipeline, None);
+        for (_, pipeline) in self.pipelines.drain() {
+            device.destroy_pipeline(pipeline, None);
+        }
         device.destroy_pipeline_layout(self.pipeline_layout, None);
         self.uploads.cleanup(device);
     }

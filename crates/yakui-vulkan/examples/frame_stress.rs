@@ -1,6 +1,7 @@
 //! Real-device regression check: three in-flight frames, five paints per frame,
 //! growing geometry/staging buffers, and more texture allocations than slots.
 //! Run with `cargo run -p yakui-vulkan --example frame_stress`.
+//! Uses dynamic rendering; add `-- --msaa` for 4x MSAA.
 use ash::vk;
 use std::{
     ffi::CStr,
@@ -12,7 +13,7 @@ use yakui_core::{
     widget::{LayoutContext, PaintContext, Widget},
     TextureId, Yakui,
 };
-use yakui_vulkan::{Options, VulkanContext, VulkanTexture, VulkanTextureCreateInfo, YakuiVulkan};
+use yakui_vulkan::{VulkanContext, VulkanTexture, VulkanTextureCreateInfo, YakuiVulkan};
 
 const EXTENT: vk::Extent2D = vk::Extent2D {
     width: 64,
@@ -71,7 +72,8 @@ impl Widget for Quad {
         constraints.constrain(Vec2::splat(64.0))
     }
     fn paint(&self, ctx: PaintContext<'_>) {
-        let x = if self.right { 32.0 } else { 0.0 };
+        // A fractional edge gives MSAA a partially covered pixel to resolve.
+        let x = if self.right { 32.25 } else { 0.0 };
         let vertices = [
             Vertex::new([x, 0.0], [0.0, 0.0], self.color),
             Vertex::new([x + 32.0, 0.0], [1.0, 0.0], self.color),
@@ -151,7 +153,7 @@ struct Frame {
     image: vk::Image,
     image_memory: vk::DeviceMemory,
     view: vk::ImageView,
-    framebuffer: vk::Framebuffer,
+    msaa: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
     readback: vk::Buffer,
     readback_memory: vk::DeviceMemory,
     pixels: *const u8,
@@ -172,7 +174,11 @@ fn memory_type(
         .expect("required memory type")
 }
 
-unsafe fn frame(context: &VulkanContext, pool: vk::CommandPool, pass: vk::RenderPass) -> Frame {
+unsafe fn frame(
+    context: &VulkanContext,
+    pool: vk::CommandPool,
+    samples: vk::SampleCountFlags,
+) -> Frame {
     let device = context.device;
     let cmd = device
         .allocate_command_buffers(
@@ -231,17 +237,49 @@ unsafe fn frame(context: &VulkanContext, pool: vk::CommandPool, pass: vk::Render
             None,
         )
         .unwrap();
-    let framebuffer = device
-        .create_framebuffer(
-            &vk::FramebufferCreateInfo::default()
-                .render_pass(pass)
-                .attachments(&[view])
-                .width(EXTENT.width)
-                .height(EXTENT.height)
-                .layers(1),
-            None,
-        )
-        .unwrap();
+    let msaa = if samples != vk::SampleCountFlags::TYPE_1 {
+        let image = device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .extent(EXTENT.into())
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(samples)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT),
+                None,
+            )
+            .unwrap();
+        let requirements = device.get_image_memory_requirements(image);
+        let memory = device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type(
+                        context,
+                        requirements,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )),
+                None,
+            )
+            .unwrap();
+        device.bind_image_memory(image, memory, 0).unwrap();
+        let view = device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .subresource_range(range),
+                None,
+            )
+            .unwrap();
+        Some((image, memory, view))
+    } else {
+        None
+    };
     let readback = device
         .create_buffer(
             &vk::BufferCreateInfo::default()
@@ -281,7 +319,7 @@ unsafe fn frame(context: &VulkanContext, pool: vk::CommandPool, pass: vk::Render
         image,
         image_memory,
         view,
-        framebuffer,
+        msaa,
         readback,
         readback_memory,
         pixels,
@@ -293,12 +331,17 @@ fn color(index: usize) -> [u8; 4] {
 }
 
 fn main() {
+    let msaa = std::env::args().any(|arg| arg == "--msaa");
     unsafe {
-        run();
+        run(if msaa {
+            vk::SampleCountFlags::TYPE_4
+        } else {
+            vk::SampleCountFlags::TYPE_1
+        });
     }
 }
 
-unsafe fn run() {
+unsafe fn run(samples: vk::SampleCountFlags) {
     let entry = ash::Entry::load().expect("load Vulkan");
     let layers = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
     let mut extensions = vec![ash::ext::debug_utils::NAME.as_ptr()];
@@ -364,21 +407,25 @@ unsafe fn run() {
         .descriptor_binding_sampled_image_update_after_bind(true);
     let mut timeline =
         vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-    let mut device_extensions = Vec::new();
+    let mut rendering =
+        vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+    let mut device_extensions = vec![ash::khr::dynamic_rendering::NAME.as_ptr()];
+
     if cfg!(target_os = "macos") {
         device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
     }
+    let device_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queues)
+        .enabled_extension_names(&device_extensions)
+        .push_next(&mut indexing)
+        .push_next(&mut timeline)
+        .push_next(&mut rendering);
+
     let device = instance
-        .create_device(
-            physical,
-            &vk::DeviceCreateInfo::default()
-                .queue_create_infos(&queues)
-                .enabled_extension_names(&device_extensions)
-                .push_next(&mut indexing)
-                .push_next(&mut timeline),
-            None,
-        )
+        .create_device(physical, &device_info, None)
         .unwrap();
+    let dynamic_loader = ash::khr::dynamic_rendering::Device::new(&instance, &device);
+    println!("Samples: {}, dynamic rendering", samples.as_raw());
     let queue = device.get_device_queue(family, 0);
     let context = VulkanContext::new(
         &device,
@@ -386,36 +433,6 @@ unsafe fn run() {
         instance.get_physical_device_memory_properties(physical),
         properties,
     );
-    let attachments = [vk::AttachmentDescription::default()
-        .format(vk::Format::R8G8B8A8_UNORM)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
-    let references = [vk::AttachmentReference {
-        attachment: 0,
-        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    }];
-    let subpasses = [vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&references)];
-    let dependencies = [vk::SubpassDependency::default()
-        .src_subpass(0)
-        .dst_subpass(vk::SUBPASS_EXTERNAL)
-        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
-        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-    let pass = device
-        .create_render_pass(
-            &vk::RenderPassCreateInfo::default()
-                .attachments(&attachments)
-                .subpasses(&subpasses)
-                .dependencies(&dependencies),
-            None,
-        )
-        .unwrap();
     let pool = device
         .create_command_pool(
             &vk::CommandPoolCreateInfo::default()
@@ -424,7 +441,7 @@ unsafe fn run() {
             None,
         )
         .unwrap();
-    let frames: Vec<_> = (0..3).map(|_| frame(&context, pool, pass)).collect();
+    let frames: Vec<_> = (0..3).map(|_| frame(&context, pool, samples)).collect();
     let mut gate_type =
         vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
     let gate = device
@@ -433,13 +450,7 @@ unsafe fn run() {
             None,
         )
         .unwrap();
-    let mut renderer = YakuiVulkan::new(
-        &context,
-        Options {
-            render_pass: pass,
-            ..Default::default()
-        },
-    );
+    let mut renderer = YakuiVulkan::new(&context);
     let mut yak = Yakui::new();
     yak.set_surface_size(Vec2::splat(64.0));
     yak.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, Vec2::splat(64.0)));
@@ -491,7 +502,7 @@ unsafe fn run() {
                 )
                 .premultiplied(batch % 3 == 1),
             );
-            // Removing an imported host view must leave the framebuffer alive.
+            // Removing an imported host view must leave the target image alive.
             // This registration is not sampled (its layout belongs to the host).
             let borrowed =
                 VulkanTexture::borrowed_view(&context, renderer.descriptors(), frame.view);
@@ -534,15 +545,63 @@ unsafe fn run() {
             let clear = [vk::ClearValue {
                 color: vk::ClearColorValue { float32: [0.0; 4] },
             }];
-            device.cmd_begin_render_pass(
+
+            let mut images = vec![frame.image];
+            if let Some((image, _, _)) = frame.msaa {
+                images.push(image);
+            }
+            let barriers: Vec<_> = images
+                .iter()
+                .map(|&image| {
+                    vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        // A reused MSAA target was written by the previous
+                        // frame's store operation, even with DONT_CARE.
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        )
+                })
+                .collect();
+            device.cmd_pipeline_barrier(
                 frame.cmd,
-                &vk::RenderPassBeginInfo::default()
-                    .render_pass(pass)
-                    .framebuffer(frame.framebuffer)
-                    .render_area(EXTENT.into())
-                    .clear_values(&clear),
-                vk::SubpassContents::INLINE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
             );
+            let mut attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(frame.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear[0]);
+            if let Some((_, _, view)) = frame.msaa {
+                attachment = attachment
+                    .image_view(view)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                    .resolve_image_view(frame.view)
+                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            }
+            dynamic_loader.cmd_begin_rendering(
+                frame.cmd,
+                &vk::RenderingInfo::default()
+                    .render_area(EXTENT.into())
+                    .layer_count(1)
+                    .color_attachments(std::slice::from_ref(&attachment)),
+            );
+
             device.cmd_set_viewport(
                 frame.cmd,
                 0,
@@ -554,7 +613,14 @@ unsafe fn run() {
                 }],
             );
             device.cmd_set_scissor(frame.cmd, 0, &[EXTENT.into()]);
-            renderer.paint(first, &context, frame.cmd, EXTENT);
+            renderer.paint(
+                first,
+                &context,
+                frame.cmd,
+                EXTENT,
+                vk::Format::R8G8B8A8_UNORM,
+                samples,
+            );
             // Leave a valid small scissor behind. The next paint is unclipped
             // and must reset it even when its first draw has clip=None.
             yak.start();
@@ -567,7 +633,14 @@ unsafe fn run() {
             yak.dom().end_widget::<Clip>(clip.id);
             yak.dom().end_widget::<OutsideClip>(outside.id);
             yak.finish();
-            renderer.paint(yak.paint(), &context, frame.cmd, EXTENT);
+            renderer.paint(
+                yak.paint(),
+                &context,
+                frame.cmd,
+                EXTENT,
+                vk::Format::R8G8B8A8_UNORM,
+                samples,
+            );
             yak.start();
             yak.dom().do_widget::<Quad>(Quad {
                 color: if batch % 3 == 2 {
@@ -582,7 +655,14 @@ unsafe fn run() {
                 ..Default::default()
             });
             yak.finish();
-            renderer.paint(yak.paint(), &context, frame.cmd, EXTENT);
+            renderer.paint(
+                yak.paint(),
+                &context,
+                frame.cmd,
+                EXTENT,
+                vk::Format::R8G8B8A8_UNORM,
+                samples,
+            );
             // A painter may emit geometry beyond its own clip (text selection
             // does this routinely). Neither repeated empty clips nor negative
             // offscreen clips may leak those triangles onto the visible target.
@@ -598,9 +678,40 @@ unsafe fn run() {
                 yak.dom().end_widget::<Clip>(clip.id);
                 yak.dom().end_widget::<OutsideClip>(outside.id);
                 yak.finish();
-                renderer.paint(yak.paint(), &context, frame.cmd, EXTENT);
+                renderer.paint(
+                    yak.paint(),
+                    &context,
+                    frame.cmd,
+                    EXTENT,
+                    vk::Format::R8G8B8A8_UNORM,
+                    samples,
+                );
             }
-            device.cmd_end_render_pass(frame.cmd);
+
+            dynamic_loader.cmd_end_rendering(frame.cmd);
+            device.cmd_pipeline_barrier(
+                frame.cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(frame.image)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    )],
+            );
+
             device.cmd_copy_image_to_buffer(
                 frame.cmd,
                 frame.image,
@@ -679,6 +790,21 @@ unsafe fn run() {
                 &right,
                 "right, frame {number}"
             );
+            let edge = &pixels[(32 * 64 + 32) * 4..][..4];
+            // Yakui snaps text geometry to pixel boundaries before rendering.
+            if samples == vk::SampleCountFlags::TYPE_1 || batch % 3 == 2 {
+                assert_eq!(edge, &right, "fully covered edge, frame {number}");
+            } else {
+                assert!(edge[3] > 0 && edge[3] < right[3],
+                    "MSAA must resolve partial coverage at a fractional edge: {edge:?}, frame {number}");
+                for channel in 0..3 {
+                    assert_eq!(
+                        edge[channel],
+                        if right[channel] == 0 { 0 } else { edge[3] },
+                        "premultiplied MSAA edge, frame {number}"
+                    );
+                }
+            }
             renderer.transfers_finished(&context);
         }
         let memory = renderer.memory_stats();
@@ -706,7 +832,11 @@ unsafe fn run() {
     );
     for frame in frames {
         device.destroy_fence(frame.fence, None);
-        device.destroy_framebuffer(frame.framebuffer, None);
+        if let Some((image, memory, view)) = frame.msaa {
+            device.destroy_image_view(view, None);
+            device.destroy_image(image, None);
+            device.free_memory(memory, None);
+        }
         device.destroy_image_view(frame.view, None);
         device.destroy_image(frame.image, None);
         device.free_memory(frame.image_memory, None);
@@ -716,7 +846,6 @@ unsafe fn run() {
     }
     device.destroy_semaphore(gate, None);
     device.destroy_command_pool(pool, None);
-    device.destroy_render_pass(pass, None);
     device.destroy_device(None);
     debug.destroy_debug_utils_messenger(messenger, None);
     instance.destroy_instance(None);

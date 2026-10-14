@@ -3,12 +3,28 @@ The application owns the Vulkan device, queue, command buffers, submission and
 completion fences. `YakuiVulkan` owns its graphics pipeline, descriptors, textures
 and reusable frame resources.
 
-Pass an existing render pass/subpass in `Options`, or enable dynamic rendering and
-set `Options::dynamic_rendering_format`. The application begins rendering, sets its
-viewport/scissor and controls attachment layouts. There is no requirement to draw
-to a swapchain image or use the presentation layout.
+Enable dynamic rendering on the device. The application creates attachments,
+begins rendering, sets viewport/scissor and controls image layouts and resolves.
+There is no requirement to draw to a swapchain image or use the presentation layout.
 
-The renderer requires Vulkan 1.2 and these enabled descriptor indexing features:
+Construction creates shared resources; each paint supplies its destination:
+
+```rust,ignore
+let mut renderer = yakui_vulkan::YakuiVulkan::new(&context);
+// Inside dynamic rendering:
+renderer.paint(paint, &context, command_buffer, resolution, format, samples);
+```
+
+Pipelines are created on first use and cached by `(format, samples)`. Use `TYPE_1`
+for single-sample rendering or a supported multisample count such as `TYPE_4`.
+The format and sample count must match the bound color attachment. The application
+owns multisampled images and their single-sample resolve destinations.
+
+The windowed demo selects 4x MSAA when supported, falling back to 2x or a single
+sample, and recreates its multisampled target when resized.
+
+The renderer requires Vulkan 1.2 with `VK_KHR_dynamic_rendering` (or Vulkan 1.3),
+the dynamic rendering feature, and these enabled descriptor indexing features:
 `descriptorBindingPartiallyBound` and
 `descriptorBindingSampledImageUpdateAfterBind`. The descriptor array holds up to
 1,000 live or pending-retirement textures. Removed textures reclaim their slots
@@ -37,8 +53,8 @@ Record uploads outside rendering, then one or more paints inside rendering:
 ```rust,ignore
 unsafe {
     renderer.transfer(yak.paint(), &context, command_buffer);
-    // Begin a render pass or dynamic rendering and set viewport/scissor.
-    renderer.paint(yak.paint(), &context, command_buffer, resolution);
+    // Begin dynamic rendering and set viewport/scissor.
+    renderer.paint(yak.paint(), &context, command_buffer, resolution, format, samples);
     // End rendering and finish/submit the command buffer on context.queue.
 }
 renderer.transfers_submitted();
@@ -75,6 +91,7 @@ check with Khronos validation installed:
 
 ```sh
 cargo run -p yakui-vulkan --example frame_stress
+cargo run -p yakui-vulkan --example frame_stress -- --msaa
 ```
 
 It checks rendered pixels with three gated frames in flight, multiple paints per
@@ -83,6 +100,9 @@ premultiplied alpha, borrowed image ownership, aligned odd-sized R8 uploads, sta
 and more texture allocations than the descriptor pool's capacity. It also checks
 backing allocations stabilize after warmup and cleanup releases all memory. It enables
 synchronization validation and fails on any validation error.
+The MSAA runs also check that fractional edges resolve to partial coverage with
+premultiplied alpha. On Linux, enable a winit platform feature
+(for example, add `--features winit/x11` to the cargo commands above).
 
 Paint opacity is carried independently of color alpha and is applied to the final
 premultiplied fragment color. The renderer blends with `ONE, ONE_MINUS_SRC_ALPHA`
